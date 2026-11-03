@@ -38,7 +38,10 @@ use tracing::instrument::Instrument as _;
 use tracing::{error_span, info, info_span};
 use tracing_subscriber::EnvFilter;
 
-use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
+use super::{
+    ClientConfig, Endpoint, EndpointConfig, RecvStream, SendDatagramError, SendStream,
+    TransportConfig,
+};
 
 /// Detect if running under Wine (test helper).
 ///
@@ -1013,6 +1016,37 @@ async fn stream_stopped_2() {
     // make sure the stopped future still resolves
     let res = stopped.await;
     assert_eq!(res, Ok(Ok(None)));
+}
+
+#[tokio::test]
+async fn datagram_bound_to_a_path() {
+    let _logging = subscribe();
+    let factory = EndpointFactory::new();
+    let mut transport_config = TransportConfig::default();
+    transport_config.max_concurrent_multipath_paths(1);
+    let server = factory.endpoint_with_config("server", transport_config.clone());
+    let client = factory.endpoint_with_config("client", transport_config);
+    let server_addr = server.local_addr().unwrap();
+
+    let (server_conn, client_conn) = tokio::join!(
+        async { server.accept().await.unwrap().await.unwrap() },
+        async {
+            client
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        }
+    );
+
+    server_conn
+        .send_datagram_on_path(PathId::ZERO, b"bound"[..].into())
+        .unwrap();
+    assert_eq!(client_conn.read_datagram().await.unwrap(), b"bound"[..]);
+    assert_eq!(
+        server_conn.send_datagram_on_path(PathId::MAX, b"lost"[..].into()),
+        Err(SendDatagramError::PathClosed)
+    );
 }
 
 #[tokio::test]

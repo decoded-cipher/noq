@@ -707,6 +707,33 @@ impl Connection {
         }
     }
 
+    /// Transmit an unreliable, unordered application datagram on `path` only, whatever the
+    /// path's status
+    ///
+    /// Each path has its own send buffer: older datagrams still queued for the same path may
+    /// be discarded to make room, as with [`send_datagram()`](Self::send_datagram).
+    pub fn send_datagram_on_path(
+        &self,
+        path: PathId,
+        data: Bytes,
+    ) -> Result<(), SendDatagramError> {
+        let conn = &mut *self.0.lock_and_wake("send_datagram_on_path");
+        if let Some(ref x) = conn.error {
+            return Err(SendDatagramError::ConnectionLost(x.clone()));
+        }
+        use proto::SendDatagramError::*;
+        match conn.inner.datagrams().send_on_path(path, data, true) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(match e {
+                Blocked(..) => unreachable!(),
+                UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
+                Disabled => SendDatagramError::Disabled,
+                TooLarge => SendDatagramError::TooLarge,
+                PathClosed => SendDatagramError::PathClosed,
+            }),
+        }
+    }
+
     /// Transmit many unreliable, unordered application datagrams in a single call.
     ///
     /// This is the batch analogue of [`send_datagram()`]: it queues the whole batch
@@ -2057,6 +2084,9 @@ pub enum SendDatagramError {
     /// The connection was lost
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
+    /// The path the datagram was bound to is closed or unknown
+    #[error("path closed")]
+    PathClosed,
 }
 
 /// The maximum amount of datagrams which will be produced in a single `drive_transmit` call
