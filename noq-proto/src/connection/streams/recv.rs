@@ -28,7 +28,7 @@ impl Recv {
     pub(super) fn new(initial_max_data: u64) -> Box<Self> {
         Box::new(Self {
             state: RecvState::default(),
-            assembler: Assembler::new(),
+            assembler: Assembler::with_receive_window(initial_max_data),
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,

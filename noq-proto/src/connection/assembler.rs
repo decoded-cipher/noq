@@ -9,7 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use crate::range_set::ArrayRangeSet;
 
 /// Helper to assemble unordered stream frames into an ordered stream
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Assembler {
     state: State,
     /// Buffered chunks, in `Buffer::cmp` order.
@@ -23,19 +23,60 @@ pub(super) struct Assembler {
     /// application, aka the stream offset.
     bytes_read: u64,
     end: u64,
+    /// Bound on the number of distinct spans kept, see [`MAX_CHUNKS`].
+    max_chunks: usize,
+}
+
+impl Default for Assembler {
+    fn default() -> Self {
+        Self {
+            state: State::default(),
+            data: VecDeque::new(),
+            buffered: 0,
+            allocated: 0,
+            bytes_read: 0,
+            end: 0,
+            max_chunks: MAX_CHUNKS,
+        }
+    }
 }
 
 impl Assembler {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    /// An assembler for a stream that may buffer up to `receive_window` bytes.
+    ///
+    /// The bound on distinct spans grows with the window, so data that legitimately
+    /// arrives out of order across the whole window (for example when a stream is spread
+    /// over multipath paths with different delays) does not exhaust it.
+    pub(super) fn with_receive_window(receive_window: u64) -> Self {
+        let scaled =
+            usize::try_from(receive_window / MIN_WINDOW_BYTES_PER_CHUNK).unwrap_or(usize::MAX);
+        Self {
+            max_chunks: max(MAX_CHUNKS, scaled),
+            ..Self::default()
+        }
     }
 
     /// Reset to the initial state
     pub(super) fn reinit(&mut self) {
         let old_data = mem::take(&mut self.data);
+        let max_chunks = self.max_chunks;
         *self = Self::default();
+        self.max_chunks = max_chunks;
         self.data = old_data;
         self.data.clear();
+    }
+
+    /// Chunk count past which `insert` compacts before deciding whether to reject.
+    ///
+    /// Above the chunk bound so a flood of mergeable frames cannot force a defragmentation
+    /// per frame.
+    fn compact_threshold(&self) -> usize {
+        2 * self.max_chunks
     }
 
     pub(super) fn is_ordered(&self) -> bool {
@@ -125,7 +166,10 @@ impl Assembler {
     /// are treated as already delivered and discarded.
     fn defragment(&mut self, start: u64) {
         // Chunks smaller than min_chunk_size are merged regardless of fragmentation
-        let min_chunk_size = max(self.buffered.div_ceil(MAX_CHUNKS), MIN_RETAINED_CHUNK_SIZE);
+        let min_chunk_size = max(
+            self.buffered.div_ceil(self.max_chunks),
+            MIN_RETAINED_CHUNK_SIZE,
+        );
         let mut buffers = mem::take(&mut self.data);
         self.buffered = 0;
         let mut fragmented_buffered = 0;
@@ -240,10 +284,10 @@ impl Assembler {
         // balance between defragmentation overhead and over-allocation.
         let threshold = 32768.max(buffered * 3 / 2);
         // Small gapped frames hold over-allocation below the threshold, so bound the count too.
-        if over_allocation > threshold || self.data.len() > COMPACT_THRESHOLD {
+        if over_allocation > threshold || self.data.len() > self.compact_threshold() {
             self.defragment(0);
             // ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?
-            if self.data.len() > MAX_CHUNKS {
+            if self.data.len() > self.max_chunks {
                 return Err(TooManyChunks);
             }
         }
@@ -381,7 +425,7 @@ pub(crate) struct IllegalOrderedRead;
 pub(crate) struct TooManyChunks;
 
 /// O(1) for a frame in order or below everything buffered, otherwise an insert that
-/// shifts up to half of `data` (see `COMPACT_THRESHOLD`).
+/// shifts up to half of `data` (see `Assembler::compact_threshold`).
 fn insert_ordered(data: &mut VecDeque<Buffer>, buffer: Buffer) {
     if data.back().is_none_or(|back| *back <= buffer) {
         data.push_back(buffer);
@@ -400,8 +444,16 @@ fn insert_ordered(data: &mut VecDeque<Buffer>, buffer: Buffer) {
 /// Bound on the number of distinct spans kept for a stream.
 ///
 /// Independent of how much memory those spans over-allocate. A frame is rejected only
-/// if compaction cannot get the count back down to this.
+/// if compaction cannot get the count back down to this. Streams with a large receive
+/// window get a proportionally larger bound, see [`MIN_WINDOW_BYTES_PER_CHUNK`].
 const MAX_CHUNKS: usize = 1024;
+
+/// Receive-window bytes per allowed span, for windows large enough to raise the bound
+/// above [`MAX_CHUNKS`].
+///
+/// A span costs a fixed amount of bookkeeping once compacted, so allowing one per KiB of
+/// window keeps that overhead a small fraction of the memory the window already permits.
+const MIN_WINDOW_BYTES_PER_CHUNK: u64 = 1024;
 
 /// Minimum size of a defragmented chunk that is retained without coalescing.
 ///
@@ -409,10 +461,8 @@ const MAX_CHUNKS: usize = 1024;
 /// being cheap to copy while reducing the overhead of many small buffer nodes.
 const MIN_RETAINED_CHUNK_SIZE: usize = 128;
 
-/// Chunk count past which `insert` compacts before deciding whether to reject.
-///
-/// Above `MAX_CHUNKS` so a flood of mergeable frames cannot force a defragmentation
-/// per frame.
+/// Compaction threshold of an assembler with the default chunk bound.
+#[cfg(test)]
 const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
 
 #[cfg(test)]
@@ -1167,5 +1217,26 @@ mod proptests {
             reference.bytes_read(),
             "bytes_read mismatch"
         );
+    }
+
+    #[test]
+    fn large_receive_window_allows_more_gaps() {
+        const FRAME_LEN: usize = 1200;
+        let frames = 4 * MAX_CHUNKS;
+        let mut default_bound = Assembler::new();
+        let mut window_bound = Assembler::with_receive_window((2 * frames * FRAME_LEN) as u64);
+        let mut default_rejected = false;
+        // Every other frame is missing, so each received frame is its own span.
+        for i in 0..frames {
+            let offset = (2 * i * FRAME_LEN) as u64;
+            let data = Bytes::from(vec![0; FRAME_LEN]);
+            default_rejected |= default_bound
+                .insert(offset, data.clone(), FRAME_LEN)
+                .is_err();
+            window_bound
+                .insert(offset, data, FRAME_LEN)
+                .expect("gaps within the receive window are accepted");
+        }
+        assert!(default_rejected, "the default bound rejects this many gaps");
     }
 }
