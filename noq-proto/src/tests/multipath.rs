@@ -2750,3 +2750,38 @@ fn declaring_an_unknown_path_lost_fails() {
     assert!(pair.conn_mut(Client).declare_path_lost(PathId(7), now).is_err());
 }
 
+#[test]
+fn peer_backup_status_moves_data_to_other_paths() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let (first, server_addr) = (PathId::ZERO, pair.routes.public_server_addr());
+    let second = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    assert_matches!(
+        pair.poll(Client),
+        Some(Event::Path(PathEvent::Established { id })) if id == second
+    );
+
+    // The client asks the server to avoid the first path.
+    pair.conn_mut(Client).set_path_status(first, PathStatus::Backup)?;
+    pair.drive();
+    let first_before = pair.path_stats(Server, first).unwrap().frame_tx.stream;
+    let second_before = pair.path_stats(Server, second).unwrap().frame_tx.stream;
+
+    let stream = pair.streams(Server).open(Dir::Uni).unwrap();
+    pair.send_stream(Server, stream).write(b"sent where the peer prefers")?;
+    pair.send_stream(Server, stream).finish()?;
+    pair.drive();
+
+    assert_eq!(pair.path_stats(Server, first).unwrap().frame_tx.stream, first_before);
+    assert_eq!(
+        pair.path_stats(Server, second).unwrap().frame_tx.stream,
+        second_before + 1
+    );
+    Ok(())
+}
+

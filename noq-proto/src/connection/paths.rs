@@ -663,6 +663,16 @@ impl PathData {
         self.status.remote_status.map(|(_seq, status)| status)
     }
 
+    /// The status that decides how this endpoint uses the path: backup if either side
+    /// asked for it, since a peer's PATH_STATUS_BACKUP asks that the path only be used when
+    /// no other path is available.
+    pub(crate) fn effective_status(&self) -> PathStatus {
+        match (self.local_status(), self.remote_status()) {
+            (PathStatus::Available, Some(PathStatus::Backup)) => PathStatus::Backup,
+            (local, _) => local,
+        }
+    }
+
     pub(crate) fn local_status(&self) -> PathStatus {
         self.status.local_status
     }

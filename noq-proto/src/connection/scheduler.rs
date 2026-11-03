@@ -15,6 +15,8 @@ pub struct PathSnapshot {
     pub id: PathId,
     /// The status this endpoint advertised for the path
     pub status: PathStatus,
+    /// The status the peer advertised for the path, if it sent one
+    pub peer_status: Option<PathStatus>,
     /// Whether the path may carry application data at all: it has connection IDs, is not
     /// abandoned, and is validated (or the handshake is still in progress)
     pub can_send_data: bool,

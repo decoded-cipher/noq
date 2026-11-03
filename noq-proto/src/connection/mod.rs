@@ -1247,6 +1247,7 @@ impl Connection {
             snapshots.push(PathSnapshot {
                 id,
                 status: data.local_status(),
+                peer_status: data.remote_status(),
                 can_send_data: self.scheduling_info(id).can_send_data,
                 smoothed_rtt: data.rtt.get(),
                 min_rtt: data.rtt.min(),
@@ -1302,7 +1303,7 @@ impl Connection {
             self.remote_cids.contains_key(path_id)
                 && !self.abandoned_paths.contains(path_id)
                 && path.data.validated
-                && path.data.local_status() == PathStatus::Available
+                && path.data.effective_status() == PathStatus::Available
         });
 
         // Such a space is able to send SpaceKind::Data frames.
@@ -1317,7 +1318,7 @@ impl Connection {
         let is_abandoned = self.abandoned_paths.contains(&path_id);
         let path_data = self.path_data(path_id);
         let validated = path_data.validated;
-        let status = path_data.local_status();
+        let status = path_data.effective_status();
 
         // During the handshake, allow 0-RTT and 0.5-RTT data before validation,
         // subject to the anti-amplification limit.
