@@ -96,6 +96,9 @@ use spaces::Retransmits;
 pub(crate) use spaces::SpaceKind;
 use spaces::{OpenStatus, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
+mod scheduler;
+pub use scheduler::{PathChoice, PathScheduler, PathSchedulerFactory, PathSnapshot};
+
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
 
@@ -177,6 +180,12 @@ pub struct Connection {
     /// deterministically select the next PathId to send on.
     // TODO(flub): well does it really? But deterministic is nice for now.
     paths: BTreeMap<PathId, PathState>,
+    /// Chooses path order and which paths carry unpinned data, if one is configured
+    path_scheduler: Option<Box<dyn PathScheduler>>,
+    /// Buffers reused by [`Connection::fill_path_order`] on every `poll_transmit`
+    path_snapshots: Vec<PathSnapshot>,
+    path_choices: Vec<PathChoice>,
+    path_order: Vec<(PathId, Option<bool>)>,
     /// Counter to uniquely identify every [`PathData`] created in this connection.
     ///
     /// Each [`PathData`] gets a [`PathData::generation`] that is unique among all
@@ -371,6 +380,11 @@ impl Connection {
         #[cfg(test)]
         let crypto_state = crypto_state.with_key_phase_size(config.initial_key_phase_size);
 
+        let path_scheduler = config
+            .path_scheduler_factory
+            .as_ref()
+            .map(|factory| factory.build(now));
+
         let mut this = Self {
             endpoint_config,
             crypto_state,
@@ -384,6 +398,10 @@ impl Connection {
                     prev: None,
                 },
             )]),
+            path_scheduler,
+            path_snapshots: Vec::new(),
+            path_choices: Vec::new(),
+            path_order: Vec::new(),
             path_generation_counter: 0,
             allow_mtud,
             state,
@@ -1092,19 +1110,25 @@ impl Connection {
                 && self.peer_supports_ack_frequency();
         }
 
-        let mut next_path_id = self.paths.first_entry().map(|e| *e.key());
-        while let Some(path_id) = next_path_id {
+        let mut order = mem::take(&mut self.path_order);
+        self.fill_path_order(now, &mut order);
+        let mut sent = None;
+        for &(path_id, unpinned_data) in &order {
+            // Sending on an earlier path can discard a later one.
+            if !self.paths.contains_key(&path_id) {
+                continue;
+            }
             if !connection_close_pending
                 && let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id)
             {
-                #[cfg(test)]
-                {
-                    self.partial_stats.transmits_tx += 1;
-                }
-                return Some(transmit);
+                sent = Some(transmit);
+                break;
             }
 
-            let info = self.scheduling_info(path_id);
+            let mut info = self.scheduling_info(path_id);
+            if let Some(allowed) = unpinned_data {
+                info.unpinned_data = allowed;
+            }
             if let Some(transmit) = self.poll_transmit_on_path(
                 now,
                 buf,
@@ -1113,11 +1137,8 @@ impl Connection {
                 &info,
                 connection_close_pending,
             ) {
-                #[cfg(test)]
-                {
-                    self.partial_stats.transmits_tx += 1;
-                }
-                return Some(transmit);
+                sent = Some(transmit);
+                break;
             }
 
             // Continue checking other paths, tail-loss probes may need to be sent
@@ -1126,8 +1147,15 @@ impl Connection {
                 buf.is_empty(),
                 "nothing to send on path but buffer not empty"
             );
-
-            next_path_id = self.paths.keys().find(|i| **i > path_id).copied();
+        }
+        order.clear();
+        self.path_order = order;
+        if let Some(transmit) = sent {
+            #[cfg(test)]
+            {
+                self.partial_stats.transmits_tx += 1;
+            }
+            return Some(transmit);
         }
 
         // We didn't produce any application data packet
@@ -1152,6 +1180,55 @@ impl Connection {
         }
 
         None
+    }
+
+    /// Fills `order` with every path, in the order [`Connection::poll_transmit`] tries them
+    ///
+    /// Each entry carries the configured [`PathScheduler`]'s decision on unpinned data, or
+    /// `None` to keep the default available/backup policy. Without a scheduler, and during
+    /// the handshake, paths are tried in [`PathId`] order.
+    fn fill_path_order(&mut self, now: Instant, order: &mut Vec<(PathId, Option<bool>)>) {
+        if self.path_scheduler.is_none() || self.is_handshaking() {
+            order.extend(self.paths.keys().map(|&id| (id, None)));
+            return;
+        }
+
+        let mut snapshots = mem::take(&mut self.path_snapshots);
+        for (&id, path) in &self.paths {
+            let data = &path.data;
+            snapshots.push(PathSnapshot {
+                id,
+                status: data.local_status(),
+                can_send_data: self.scheduling_info(id).can_send_data,
+                smoothed_rtt: data.rtt.get(),
+                min_rtt: data.rtt.min(),
+                rtt_variance: data.rtt.var(),
+                congestion_window: data.congestion.window(),
+                bytes_in_flight: data.in_flight.bytes,
+                mtu: data.current_mtu(),
+            });
+        }
+        let mut choices = mem::take(&mut self.path_choices);
+        if let Some(scheduler) = &mut self.path_scheduler {
+            scheduler.schedule(now, &snapshots, &mut choices);
+        }
+
+        for choice in &choices {
+            if self.paths.contains_key(&choice.id) && !order.iter().any(|&(id, _)| id == choice.id)
+            {
+                order.push((choice.id, Some(choice.unpinned_data)));
+            }
+        }
+        for &id in self.paths.keys() {
+            if !order.iter().any(|&(listed, _)| listed == id) {
+                order.push((id, Some(false)));
+            }
+        }
+
+        snapshots.clear();
+        choices.clear();
+        self.path_snapshots = snapshots;
+        self.path_choices = choices;
     }
 
     /// Computes the packet scheduling information for this path.
@@ -1234,6 +1311,7 @@ impl Connection {
             is_abandoned,
             can_send_data,
             status_allows_data,
+            unpinned_data: status_allows_data,
             may_send_close,
             may_self_abandon,
         }
@@ -1493,8 +1571,13 @@ impl Connection {
                 // A new datagram needs to be started.
                 transmit.segment_size()
             };
-            let can_send =
-                self.space_can_send(space_id, path_id, max_packet_size, connection_close_pending);
+            let can_send = self.space_can_send(
+                space_id,
+                path_id,
+                max_packet_size,
+                connection_close_pending,
+                scheduling_info.unpinned_data,
+            );
             let needs_loss_probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
             let space_will_send = {
                 if scheduling_info.is_abandoned {
@@ -1518,11 +1601,12 @@ impl Connection {
                     // Other space-specific frames are only sent if the path is validated.
                     true
                 } else {
-                    // Anything else we only send if we're the best path for SpaceKind::Data
-                    // frames.
-                    !can_send.is_empty()
-                        && scheduling_info.can_send_data
-                        && scheduling_info.status_allows_data
+                    // Connection-level frames we only send if we're the best path for
+                    // SpaceKind::Data frames. Data not pinned to a path is already limited to
+                    // the paths allowed to carry it.
+                    scheduling_info.can_send_data
+                        && (can_send.unpinned_data
+                            || (!can_send.is_empty() && scheduling_info.status_allows_data))
                 }
             };
 
@@ -1752,7 +1836,7 @@ impl Connection {
             debug_assert!(
                 !(builder.sent_frames().is_ack_only(&self.streams)
                     && !can_send.acks
-                    && (can_send.other || can_send.space_specific)
+                    && (can_send.other || can_send.space_specific || can_send.unpinned_data)
                     && builder.buf.segment_size()
                         == self.path_data(path_id).current_mtu() as usize
                     && self.datagrams.outgoing.is_empty()),
@@ -1789,7 +1873,13 @@ impl Connection {
                 && let Some(next_space_id) = space_id.next()
                 && max_packet_size > MIN_PACKET_SPACE
                 && self
-                    .space_can_send(space_id, path_id, max_packet_size, connection_close_pending)
+                    .space_can_send(
+                        space_id,
+                        path_id,
+                        max_packet_size,
+                        connection_close_pending,
+                        scheduling_info.unpinned_data,
+                    )
                     .is_empty()
                 && self.has_pending_packet(next_space_id, max_packet_size, connection_close_pending)
             {
@@ -1933,6 +2023,7 @@ impl Connection {
                 PathId::ZERO,
                 max_packet_size,
                 connection_close_pending,
+                true,
             );
             if !can_send.is_empty() {
                 return true;
@@ -1973,7 +2064,10 @@ impl Connection {
         let bytes_to_send = transmit.segment_size() as u64;
         let need_loss_probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
 
-        if (can_send.other || can_send.space_specific) && !need_loss_probe && !can_send.close {
+        if (can_send.other || can_send.space_specific || can_send.unpinned_data)
+            && !need_loss_probe
+            && !can_send.close
+        {
             let path = self.path_data(path_id);
             if path.in_flight.bytes + bytes_to_send > path.congestion.window() {
                 trace!(
@@ -2199,13 +2293,15 @@ impl Connection {
     ///
     /// *packet_size* is the number of bytes available to build the next packet.
     /// *connection_close_pending* indicates whether a CONNECTION_CLOSE frame needs to be
-    /// sent.
+    /// sent. *unpinned_data* indicates whether this path may carry stream data and datagrams
+    /// that are not pinned to a path.
     fn space_can_send(
         &mut self,
         space_id: SpaceId,
         path_id: PathId,
         packet_size: usize,
         connection_close_pending: bool,
+        unpinned_data: bool,
     ) -> SendableFrames {
         let space = &mut self.spaces[space_id];
         let space_has_crypto = self.crypto_state.has_keys(space_id.encryption_level());
@@ -2231,7 +2327,7 @@ impl Connection {
             // (application datagrams).
             let frame_space_1rtt =
                 packet_size.saturating_sub(self.predict_1rtt_overhead(pn, path_id));
-            can_send |= self.can_send_1rtt(path_id, frame_space_1rtt);
+            can_send |= self.can_send_1rtt(path_id, frame_space_1rtt, unpinned_data);
         }
 
         can_send.close = connection_close_pending && space_has_crypto;
@@ -6536,7 +6632,7 @@ impl Connection {
         let mut sent_datagrams = false;
         while !scheduling_info.is_abandoned
             && scheduling_info.can_send_data
-            && scheduling_info.status_allows_data
+            && scheduling_info.unpinned_data
             && builder.frame_space_remaining() > Datagram::SIZE_BOUND
             && space_id == SpaceId::Data
         {
@@ -6600,7 +6696,7 @@ impl Connection {
                 builder,
                 stats,
                 path_id,
-                scheduling_info.status_allows_data,
+                scheduling_info.unpinned_data,
             );
         }
     }
@@ -6989,7 +7085,7 @@ impl Connection {
     ///
     /// See also [`PacketSpace::can_send`] which keeps track of all other frame types that
     /// may need to be sent.
-    fn can_send_1rtt(&self, path_id: PathId, max_size: usize) -> SendableFrames {
+    fn can_send_1rtt(&self, path_id: PathId, max_size: usize, unpinned_data: bool) -> SendableFrames {
         let network_path = self.path_data(path_id).network_path;
         let probing_frames = self
             .paths
@@ -7002,8 +7098,9 @@ impl Connection {
         let space_specific = self.streams.can_send_sticky_stream_data(path_id);
 
         // Stream control frames are checked in PacketSpace::can_send, only check data here.
-        let other = self.streams.can_send_any_stream_data()
-            || self.datagrams.outgoing.can_send_1rtt(max_size);
+        let unpinned_data = unpinned_data
+            && (self.streams.can_send_any_stream_data()
+                || self.datagrams.outgoing.can_send_1rtt(max_size));
 
         // All `false` fields are set in PacketSpace::can_send.
         SendableFrames {
@@ -7011,7 +7108,8 @@ impl Connection {
             close: false,
             probing_frames,
             space_specific,
-            other,
+            other: false,
+            unpinned_data,
         }
     }
 
@@ -7359,6 +7457,10 @@ struct PathSchedulingInfo {
     ///
     /// Always true during the handshake.
     status_allows_data: bool,
+    /// Whether this path may carry stream data and datagrams that are not pinned to a path.
+    ///
+    /// Follows `status_allows_data` unless a [`PathScheduler`] decides otherwise.
+    unpinned_data: bool,
     /// Whether the path may send a CONNECTION_CLOSE frame.
     ///
     /// This essentially marks this path as the best validated space ID with a fallback

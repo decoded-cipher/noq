@@ -165,6 +165,7 @@ impl PacketSpace {
             probing_frames,
             space_specific,
             other,
+            unpinned_data: false,
         }
     }
 }
@@ -1067,6 +1068,9 @@ pub(super) struct SendableFrames {
     pub(super) space_specific: bool,
     /// Whether there are any other frames to send, these are ack-eliciting.
     pub(super) other: bool,
+    /// Whether there is stream data or datagrams not pinned to a path that this path may
+    /// carry, these are ack-eliciting.
+    pub(super) unpinned_data: bool,
 }
 
 impl SendableFrames {
@@ -1078,6 +1082,7 @@ impl SendableFrames {
             probing_frames: false,
             space_specific: false,
             other: false,
+            unpinned_data: false,
         }
     }
 
@@ -1089,12 +1094,13 @@ impl SendableFrames {
             probing_frames,
             space_specific,
             other,
+            unpinned_data,
         } = *self;
         if close {
             // No ack-eliciting frames are included with a CONNECTION_CLOSE, only acks.
             return false;
         }
-        probing_frames || space_specific || other
+        probing_frames || space_specific || other || unpinned_data
     }
 
     /// Whether no data is sendable.
@@ -1105,8 +1111,9 @@ impl SendableFrames {
             probing_frames,
             space_specific,
             other,
+            unpinned_data,
         } = *self;
-        !acks && !close && !probing_frames && !space_specific && !other
+        !acks && !close && !probing_frames && !space_specific && !other && !unpinned_data
     }
 }
 
@@ -1118,6 +1125,7 @@ impl ::core::ops::BitOrAssign for SendableFrames {
             probing_frames,
             space_specific,
             other,
+            unpinned_data,
         } = rhs;
 
         self.acks |= acks;
@@ -1125,6 +1133,7 @@ impl ::core::ops::BitOrAssign for SendableFrames {
         self.probing_frames |= probing_frames;
         self.space_specific |= space_specific;
         self.other |= other;
+        self.unpinned_data |= unpinned_data;
     }
 }
 

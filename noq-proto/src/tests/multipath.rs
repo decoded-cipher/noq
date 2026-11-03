@@ -11,8 +11,9 @@ use tracing::info;
 use crate::connection::timer::{PathTimer, Timer};
 use crate::{
     ClientConfig, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, FourTuple,
-    LOCAL_CID_COUNT, NetworkChangeHint, PathId, PathStatus, RandomConnectionIdGenerator,
-    ServerConfig, Side::*, TransportConfig, cid_queue::CidQueue,
+    Instant, LOCAL_CID_COUNT, NetworkChangeHint, PathChoice, PathError, PathId, PathScheduler,
+    PathSchedulerFactory, PathSnapshot, PathStatus, RandomConnectionIdGenerator, ServerConfig,
+    Side::*, TransportConfig, cid_queue::CidQueue,
 };
 use crate::{
     ClosePathError, Dir, Event, PathAbandonReason, PathEvent, StreamAffinity, StreamEvent,
@@ -2607,3 +2608,104 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+/// Lists a fixed set of path choices, whatever the paths look like.
+#[derive(Debug, Clone)]
+struct FixedPathScheduler(Vec<PathChoice>);
+
+impl PathScheduler for FixedPathScheduler {
+    fn schedule(&mut self, _now: Instant, _paths: &[PathSnapshot], choices: &mut Vec<PathChoice>) {
+        choices.extend_from_slice(&self.0);
+    }
+}
+
+impl PathSchedulerFactory for FixedPathScheduler {
+    fn build(&self, _now: Instant) -> Box<dyn PathScheduler> {
+        Box::new(self.clone())
+    }
+}
+
+/// Connects with a fixed path scheduler and opens a second available path.
+fn pair_with_path_scheduler(choices: Vec<PathChoice>) -> Result<ConnPair, PathError> {
+    let mut transport = TransportConfig::default();
+    transport.path_scheduler_factory(Some(Arc::new(FixedPathScheduler(choices))));
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(transport)
+        .enable_multipath()
+        .connect();
+    let server_addr = pair.routes.public_server_addr();
+    let second = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    assert_eq!(second, PathId(1));
+    assert_matches!(
+        pair.poll(Client),
+        Some(Event::Path(PathEvent::Established { id })) if id == second
+    );
+    Ok(pair)
+}
+
+fn stream_frames_sent(pair: &mut ConnPair, path: PathId) -> u64 {
+    pair.path_stats(Client, path).unwrap().frame_tx.stream
+}
+
+#[test]
+fn path_scheduler_moves_unpinned_data_to_its_chosen_path() -> TestResult {
+    let _guard = subscribe();
+    let (first, second) = (PathId::ZERO, PathId(1));
+    let mut pair = pair_with_path_scheduler(vec![
+        PathChoice {
+            id: second,
+            unpinned_data: true,
+        },
+        PathChoice {
+            id: first,
+            unpinned_data: false,
+        },
+    ])?;
+    let (first_before, second_before) = (
+        stream_frames_sent(&mut pair, first),
+        stream_frames_sent(&mut pair, second),
+    );
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    const MSG: &[u8] = b"unpinned data follows the scheduler";
+    pair.send_stream(Client, stream).write(MSG)?;
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive();
+
+    assert_eq!(stream_frames_sent(&mut pair, first), first_before);
+    assert_eq!(stream_frames_sent(&mut pair, second), second_before + 1);
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    let mut recv = pair.recv_stream(Server, stream);
+    let mut chunks = recv.read(true)?;
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes == MSG);
+    let _ = chunks.finalize();
+    Ok(())
+}
+
+#[test]
+fn paths_left_out_by_the_scheduler_carry_only_pinned_data() -> TestResult {
+    let _guard = subscribe();
+    let first = PathId::ZERO;
+    let mut pair = pair_with_path_scheduler(Vec::new())?;
+    let before = stream_frames_sent(&mut pair, first);
+
+    let unpinned = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, unpinned).write(b"waits for a path")?;
+    pair.drive();
+    assert_eq!(stream_frames_sent(&mut pair, first), before);
+    assert_eq!(stream_frames_sent(&mut pair, PathId(1)), 0);
+
+    let pinned = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, pinned)
+        .set_affinity(StreamAffinity::Sticky(first))?;
+    pair.send_stream(Client, pinned).write(b"pinned data still flows")?;
+    pair.drive();
+    assert_eq!(stream_frames_sent(&mut pair, first), before + 1);
+    Ok(())
+}
+

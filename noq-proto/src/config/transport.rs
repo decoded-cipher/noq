@@ -10,8 +10,8 @@ use core::{
 };
 
 use crate::{
-    ConnectionId, Duration, INITIAL_MTU, Instant, MAX_UDP_PAYLOAD, Side, VarInt,
-    VarIntBoundsExceeded, address_discovery, congestion, connection::qlog::QlogSink,
+    ConnectionId, Duration, INITIAL_MTU, Instant, MAX_UDP_PAYLOAD, PathSchedulerFactory, Side,
+    VarInt, VarIntBoundsExceeded, address_discovery, congestion, connection::qlog::QlogSink,
 };
 #[cfg(feature = "qlog")]
 use crate::{QlogFactory, QlogFileFactory};
@@ -59,6 +59,7 @@ pub struct TransportConfig {
     pub(crate) initial_key_phase_size: Option<u64>,
 
     pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
+    pub(crate) path_scheduler_factory: Option<Arc<dyn PathSchedulerFactory>>,
 
     pub(crate) enable_segmentation_offload: bool,
 
@@ -368,6 +369,18 @@ impl TransportConfig {
         self
     }
 
+    /// How multipath paths are chosen for data that is not pinned to a path
+    ///
+    /// Without a factory, paths are tried in [`PathId`](crate::PathId) order and unpinned
+    /// data prefers available paths over backup ones. See [`PathScheduler`](crate::PathScheduler).
+    pub fn path_scheduler_factory(
+        &mut self,
+        factory: Option<Arc<dyn PathSchedulerFactory>>,
+    ) -> &mut Self {
+        self.path_scheduler_factory = factory;
+        self
+    }
+
     /// Whether to use "Generic Segmentation Offload" to accelerate transmits, when supported by the
     /// environment
     ///
@@ -602,6 +615,7 @@ impl Default for TransportConfig {
             initial_key_phase_size: None,
 
             congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
+            path_scheduler_factory: None,
 
             enable_segmentation_offload: true,
 
@@ -651,6 +665,7 @@ impl fmt::Debug for TransportConfig {
             #[cfg(test)]
                 initial_key_phase_size: _,
             congestion_controller_factory: _,
+            path_scheduler_factory,
             enable_segmentation_offload,
             address_discovery_role,
             max_concurrent_multipath_paths,
@@ -691,6 +706,7 @@ impl fmt::Debug for TransportConfig {
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             // congestion_controller_factory not debug
+            .field("path_scheduler_factory", path_scheduler_factory)
             .field("enable_segmentation_offload", enable_segmentation_offload)
             .field("address_discovery_role", address_discovery_role)
             .field(
