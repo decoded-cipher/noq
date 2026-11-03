@@ -1196,6 +1196,10 @@ impl InboundQueue {
         }
     }
 
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Inbound> {
+        self.inner.values_mut()
+    }
+
     pub(super) fn push(&mut self, recv_time: Instant, inbound: Inbound) {
         let key = (recv_time, self.next_seq);
         self.next_seq += 1;

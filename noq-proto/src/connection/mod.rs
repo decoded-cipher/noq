@@ -2865,6 +2865,8 @@ impl Connection {
             // Add<PathStats> for ConnectionStats`.
             stats += *path_stats;
         }
+        stats.key_updates = self.crypto_state.key_updates;
+        stats.authentication_failures = self.authentication_failures;
 
         stats
     }

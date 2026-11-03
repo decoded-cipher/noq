@@ -322,6 +322,10 @@ pub struct ConnectionStats {
     ///
     /// See also [`PathStats::lost_bytes`].
     pub lost_bytes: u64,
+    /// The number of 1-RTT key updates, started by either end.
+    pub key_updates: u64,
+    /// The number of received packets dropped because they failed authentication.
+    pub authentication_failures: u64,
 
     /// Number of [`super::Transmit`] produced by this connection.
     #[cfg(test)]
@@ -365,6 +369,9 @@ impl core::ops::Add<PathStats> for ConnectionStats {
             sent_bytes: self.sent_bytes + sent_bytes,
             lost_packets: self.lost_packets + lost_packets,
             lost_bytes: self.lost_bytes + lost_bytes,
+            // Connection-level counters, not per path.
+            key_updates: self.key_updates,
+            authentication_failures: self.authentication_failures,
             #[cfg(test)]
             transmits_tx: self.transmits_tx,
         }
@@ -406,6 +413,8 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
             sent_bytes,
             lost_packets,
             lost_bytes,
+            key_updates: _,
+            authentication_failures: _,
             #[cfg(test)]
                 transmits_tx: _,
         } = self;

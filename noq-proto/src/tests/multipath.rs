@@ -2998,3 +2998,29 @@ fn datagrams_bound_to_a_closed_path_are_dropped() -> TestResult {
     assert_eq!(pair.datagrams(Server).recv(), None);
     Ok(())
 }
+
+#[test]
+fn key_updates_and_authentication_failures_are_counted() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let before = (pair.stats(Client).key_updates, pair.stats(Server).key_updates);
+
+    pair.conn_mut(Client).force_key_update();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"sent with the new keys")?;
+    pair.drive();
+    assert!(pair.stats(Client).key_updates > before.0);
+    assert!(pair.stats(Server).key_updates > before.1);
+
+    // A packet damaged in transit fails authentication and is dropped.
+    let failures = pair.stats(Server).authentication_failures;
+    pair.send_stream(Client, stream).write(b"damaged on the way")?;
+    pair.drive_client();
+    for inbound in pair.server.inbound.iter_mut() {
+        let last = inbound.packet.len() - 1;
+        inbound.packet[last] ^= 0xff;
+    }
+    pair.drive();
+    assert!(pair.stats(Server).authentication_failures > failures);
+    Ok(())
+}

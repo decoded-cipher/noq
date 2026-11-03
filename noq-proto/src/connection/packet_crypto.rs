@@ -106,6 +106,8 @@ pub(super) struct CryptoState {
     pub(super) key_phase: bool,
     /// How many packets are in the current key phase. Used only for `Data` space.
     pub(super) key_phase_size: u64,
+    /// How many 1-RTT key updates have happened, started by either end.
+    pub(super) key_updates: u64,
 }
 
 impl CryptoState {
@@ -137,6 +139,7 @@ impl CryptoState {
             // response. Inspired by quic-go's similar behavior of performing the first key update
             // at the 100th short-header packet.
             key_phase_size: rng.random_range(10..1000),
+            key_updates: 0,
         }
     }
 
@@ -421,6 +424,7 @@ impl CryptoState {
 
         self.key_phase_size = confidentiality_limit.saturating_sub(KEY_UPDATE_MARGIN);
         self.key_phase = !self.key_phase;
+        self.key_updates += 1;
         self.spaces[2].sent_with_keys = 0;
     }
 
