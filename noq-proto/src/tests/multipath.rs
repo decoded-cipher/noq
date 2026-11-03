@@ -5,6 +5,7 @@ use core::{net::SocketAddr, num::NonZeroU32, time::Duration};
 use std::dbg;
 
 use assert_matches::assert_matches;
+use bytes::Bytes;
 use testresult::TestResult;
 use tracing::info;
 
@@ -16,8 +17,8 @@ use crate::{
     Side::{self, *}, TransportConfig, cid_queue::CidQueue,
 };
 use crate::{
-    ClosePathError, Dir, Event, PathAbandonReason, PathEvent, StreamAffinity, StreamEvent,
-    TransportErrorCode, n0_nat_traversal,
+    ClosePathError, Dir, Event, PathAbandonReason, PathEvent, SendDatagramError, StreamAffinity,
+    StreamEvent, TransportErrorCode, n0_nat_traversal,
 };
 
 use super::util::{
@@ -2788,7 +2789,14 @@ fn peer_backup_status_moves_data_to_other_paths() -> TestResult {
 
 /// Connects with multipath and opens a second available path.
 fn pair_with_two_paths() -> Result<ConnPair, PathError> {
-    let mut pair = ConnPair::builder().enable_multipath().connect();
+    pair_with_two_paths_and(TransportConfig::default())
+}
+
+fn pair_with_two_paths_and(transport: TransportConfig) -> Result<ConnPair, PathError> {
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(transport)
+        .enable_multipath()
+        .connect();
     let server_addr = pair.routes.public_server_addr();
     let second = pair.open_path(
         Client,
@@ -2911,5 +2919,82 @@ fn declaring_a_path_lost_keeps_its_congestion_window() -> TestResult {
     assert_eq!(after.congestion_events, before.congestion_events);
     assert!(after.cwnd >= before.cwnd);
     assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    Ok(())
+}
+
+fn datagrams_sent(pair: &mut ConnPair, side: Side, path: PathId) -> u64 {
+    pair.path_stats(side, path).unwrap().frame_tx.datagram
+}
+
+#[test]
+fn datagrams_bound_to_a_path_are_sent_on_it() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = pair_with_two_paths()?;
+    let (first, second) = (PathId::ZERO, PathId(1));
+    // Like sticky streams, bound datagrams ignore the path's backup status.
+    pair.conn_mut(Client).set_path_status(second, PathStatus::Backup)?;
+    pair.drive();
+    let first_before = datagrams_sent(&mut pair, Client, first);
+    let second_before = datagrams_sent(&mut pair, Client, second);
+
+    const MSG: &[u8] = b"bound to the backup path";
+    pair.datagrams(Client)
+        .send_on_path(second, Bytes::from_static(MSG), false)?;
+    pair.drive();
+
+    assert_eq!(datagrams_sent(&mut pair, Client, first), first_before);
+    assert_eq!(datagrams_sent(&mut pair, Client, second), second_before + 1);
+    assert_eq!(pair.datagrams(Server).recv(), Some(Bytes::from_static(MSG)));
+    Ok(())
+}
+
+#[test]
+fn each_path_has_its_own_datagram_send_buffer() -> TestResult {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.datagram_send_buffer_size(4000);
+    let mut pair = pair_with_two_paths_and(transport)?;
+    let (first, second) = (PathId::ZERO, PathId(1));
+    let datagram = Bytes::from_static(&[0; 1000]);
+
+    // Three fit in the first path's buffer, the fourth does not.
+    for _ in 0..3 {
+        pair.datagrams(Client)
+            .send_on_path(first, datagram.clone(), false)?;
+    }
+    assert_matches!(
+        pair.datagrams(Client)
+            .send_on_path(first, datagram.clone(), false),
+        Err(SendDatagramError::Blocked(_))
+    );
+    assert_eq!(pair.datagrams(Client).queued_on_path(first), 3000);
+
+    // Other paths and unbound datagrams are unaffected.
+    pair.datagrams(Client)
+        .send_on_path(second, datagram.clone(), false)?;
+    pair.datagrams(Client).send(datagram, false)?;
+    assert_eq!(pair.datagrams(Client).queued_on_path(second), 1000);
+    Ok(())
+}
+
+#[test]
+fn datagrams_bound_to_a_closed_path_are_dropped() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = pair_with_two_paths()?;
+    let second = PathId(1);
+    pair.datagrams(Client)
+        .send_on_path(second, Bytes::from_static(b"never sent"), false)?;
+    pair.close_path(Client, second, 0u8.into())?;
+
+    for path in [second, PathId(7)] {
+        assert_matches!(
+            pair.datagrams(Client)
+                .send_on_path(path, Bytes::from_static(b"refused"), false),
+            Err(SendDatagramError::PathClosed)
+        );
+    }
+    pair.drive();
+    assert_eq!(pair.datagrams(Client).queued_on_path(second), 0);
+    assert_eq!(pair.datagrams(Server).recv(), None);
     Ok(())
 }

@@ -1910,7 +1910,7 @@ impl Connection {
                     && (can_send.other || can_send.space_specific || can_send.unpinned_data)
                     && builder.buf.segment_size()
                         == self.path_data(path_id).current_mtu() as usize
-                    && self.datagrams.outgoing.is_empty()),
+                    && !self.datagrams.has_outgoing(path_id)),
                 "SendableFrames was {can_send:?}, but only ACKs have been written"
             );
             if builder.sent_frames().requires_padding {
@@ -3634,6 +3634,7 @@ impl Connection {
         self.partial_stats += path_stats;
         self.paths.remove(&path_id);
         self.spaces[SpaceId::Data].number_spaces.remove(&path_id);
+        self.datagrams.discard_path(path_id);
 
         self.events.push_back(
             PathEvent::Discarded {
@@ -6742,11 +6743,13 @@ impl Connection {
         let mut sent_datagrams = false;
         while !scheduling_info.is_abandoned
             && scheduling_info.can_send_data
-            && scheduling_info.unpinned_data
             && builder.frame_space_remaining() > Datagram::SIZE_BOUND
             && space_id == SpaceId::Data
         {
-            match self.datagrams.write(builder, stats) {
+            match self
+                .datagrams
+                .write(path_id, scheduling_info.unpinned_data, builder, stats)
+            {
                 true => {
                     sent_datagrams = true;
                 }
@@ -7205,7 +7208,8 @@ impl Connection {
                 .number_spaces
                 .get(&path_id)
                 .is_some_and(|pns| pns.pending_path_responses.has_pending_on_path(network_path));
-        let space_specific = self.streams.can_send_sticky_stream_data(path_id);
+        let space_specific = self.streams.can_send_sticky_stream_data(path_id)
+            || self.datagrams.can_send_on_path(path_id, max_size);
 
         // Stream control frames are checked in PacketSpace::can_send, only check data here.
         let unpinned_data = unpinned_data

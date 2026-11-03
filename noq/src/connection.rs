@@ -701,6 +701,8 @@ impl Connection {
                 UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
                 Disabled => SendDatagramError::Disabled,
                 TooLarge => SendDatagramError::TooLarge,
+                // Only sends bound to a path can find it closed.
+                PathClosed => unreachable!(),
             }),
         }
     }
@@ -731,6 +733,8 @@ impl Connection {
                     UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
                     Disabled => SendDatagramError::Disabled,
                     TooLarge => SendDatagramError::TooLarge,
+                    // Only sends bound to a path can find it closed.
+                    PathClosed => unreachable!(),
                 }
             })
     }
@@ -1298,6 +1302,8 @@ impl Future for SendDatagram<'_> {
                 UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
                 Disabled => SendDatagramError::Disabled,
                 TooLarge => SendDatagramError::TooLarge,
+                // Only sends bound to a path can find it closed.
+                PathClosed => unreachable!(),
             })),
         }
     }

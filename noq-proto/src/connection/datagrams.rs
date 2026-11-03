@@ -6,7 +6,7 @@ use tracing::{debug, trace};
 
 use super::Connection;
 use crate::{
-    FrameStats, TransportError,
+    FrameStats, FxHashMap, PathId, TransportError,
     connection::PacketBuilder,
     frame::{Datagram, FrameStruct},
 };
@@ -27,6 +27,37 @@ impl Datagrams<'_> {
     ///
     /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
     pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
+        self.queue(None, data, drop)
+    }
+
+    /// Queue an unreliable, unordered datagram to be sent on `path` only
+    ///
+    /// Unlike datagrams queued with [`Self::send`], the datagram is not subject to the path
+    /// scheduler or to the paths' available/backup status: it is sent on `path` as soon as
+    /// that path can send, ahead of datagrams not bound to a path. Each path has its own send
+    /// buffer of [`TransportConfig::datagram_send_buffer_size`] bytes, so datagrams waiting on
+    /// a slow path never displace those for other paths, and `drop` applies to that buffer as
+    /// in [`Self::send`]. Datagrams still queued when the path is discarded are dropped.
+    ///
+    /// [`TransportConfig::datagram_send_buffer_size`]: crate::TransportConfig::datagram_send_buffer_size
+    pub fn send_on_path(
+        &mut self,
+        path: PathId,
+        data: Bytes,
+        drop: bool,
+    ) -> Result<(), SendDatagramError> {
+        if !self.conn.paths.contains_key(&path) || self.conn.abandoned_paths.contains(&path) {
+            return Err(SendDatagramError::PathClosed);
+        }
+        self.queue(Some(path), data, drop)
+    }
+
+    fn queue(
+        &mut self,
+        path: Option<PathId>,
+        data: Bytes,
+        drop: bool,
+    ) -> Result<(), SendDatagramError> {
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
         }
@@ -37,19 +68,18 @@ impl Datagrams<'_> {
         if data.len() > Ord::min(max, send_buffer_size) {
             return Err(SendDatagramError::TooLarge);
         }
+        let datagrams = &mut self.conn.datagrams;
+        let buffer = match path {
+            None => &mut datagrams.outgoing,
+            Some(path) => datagrams.outgoing_on_path.entry(path).or_default(),
+        };
         if drop {
-            self.conn
-                .datagrams
-                .make_space_for(data.len(), send_buffer_size);
-        } else if !self
-            .conn
-            .datagrams
-            .has_send_buffer_space(data.len(), send_buffer_size)
-        {
-            self.conn.datagrams.send_blocked = true;
+            buffer.make_space_for(data.len(), send_buffer_size);
+        } else if !buffer.has_send_buffer_space(data.len(), send_buffer_size) {
+            datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        self.conn.datagrams.outgoing.push_back(Datagram { data });
+        buffer.push_back(Datagram { data });
         Ok(())
     }
 
@@ -91,23 +121,18 @@ impl Datagrams<'_> {
         }
 
         let mut queued = 0usize;
+        let state = &mut self.conn.datagrams;
         for data in datagrams {
             if drop {
-                self.conn
-                    .datagrams
-                    .make_space_for(data.len(), send_buffer_size);
-            } else if !self
-                .conn
-                .datagrams
+                state.outgoing.make_space_for(data.len(), send_buffer_size);
+            } else if !state
+                .outgoing
                 .has_send_buffer_space(data.len(), send_buffer_size)
             {
-                self.conn.datagrams.send_blocked = true;
+                state.send_blocked = true;
                 break;
             }
-            self.conn
-                .datagrams
-                .outgoing
-                .push_back(Datagram { data: data.clone() });
+            state.outgoing.push_back(Datagram { data: data.clone() });
             queued += 1;
         }
 
@@ -169,12 +194,25 @@ impl Datagrams<'_> {
             .saturating_sub(self.conn.datagrams.outgoing.payload_bytes)
             .saturating_sub(size_of::<Datagram>())
     }
+
+    /// Payload bytes of the datagrams queued with [`Self::send_on_path`] that are still
+    /// waiting to be sent on `path`
+    pub fn queued_on_path(&self, path: PathId) -> usize {
+        self.conn
+            .datagrams
+            .outgoing_on_path
+            .get(&path)
+            .map_or(0, |buffer| buffer.payload_bytes)
+    }
 }
 
 #[derive(Default)]
 pub(super) struct DatagramState {
     pub(super) incoming: DatagramBuffer,
+    /// Outgoing datagrams any path allowed to carry unpinned data may send
     pub(super) outgoing: DatagramBuffer,
+    /// Outgoing datagrams bound to one path, each path with its own send buffer
+    pub(super) outgoing_on_path: FxHashMap<PathId, DatagramBuffer>,
     pub(super) send_blocked: bool,
 }
 
@@ -209,23 +247,6 @@ impl DatagramState {
         Ok(was_empty)
     }
 
-    fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
-        while !self.has_send_buffer_space(datagram_len, send_buffer_size) {
-            let Some(prev) = self.outgoing.pop_front() else {
-                break;
-            };
-            trace!(len = prev.data.len(), "dropping outgoing datagram");
-        }
-    }
-
-    fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
-        let Some(total) = self.outgoing.memory_used().checked_add(datagram_len) else {
-            return false;
-        };
-
-        total <= send_buffer_size
-    }
-
     /// Discard outgoing datagrams with a payload larger than `max_payload` bytes
     ///
     /// Returns whether any datagrams were dropped.
@@ -233,45 +254,53 @@ impl DatagramState {
     /// Used to ensure that reductions in MTU don't get us stuck in a state where we have a datagram
     /// queued but can't send it.
     pub(super) fn drop_oversized(&mut self, max_payload: usize) -> bool {
-        let mut dropped_any = false;
-        self.outgoing.queue.retain(|datagram| {
-            let result = datagram.data.len() < max_payload;
-            if !result {
-                trace!(
-                    "dropping {} byte datagram violating {} byte limit",
-                    datagram.data.len(),
-                    max_payload
-                );
-                self.outgoing.payload_bytes -= datagram.data.len();
-                dropped_any = true;
-            }
-            result
-        });
+        let mut dropped_any = self.outgoing.drop_oversized(max_payload);
+        for buffer in self.outgoing_on_path.values_mut() {
+            dropped_any |= buffer.drop_oversized(max_payload);
+        }
         dropped_any
     }
 
-    /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
+    /// Attempt to write a datagram frame for `path` into `buf`: one bound to the path, or if
+    /// `unpinned` is set, one any path may send
     ///
-    /// Returns whether a frame was written. At most `max_size` bytes will be written, including
-    /// framing.
+    /// Returns whether a frame was written.
     pub(super) fn write<'a, 'b>(
         &mut self,
+        path: PathId,
+        unpinned: bool,
         buf: &mut PacketBuilder<'a, 'b>,
         stat: &mut FrameStats,
     ) -> bool {
-        let Some(datagram) = self.outgoing.pop_front() else {
-            return false;
-        };
-
-        if buf.frame_space_remaining() < datagram.size(true) {
-            // Future work: we could be more clever about cramming small datagrams into
-            // mostly-full packets when a larger one is queued first
-            self.outgoing.push_front(datagram);
-            return false;
+        if let Some(buffer) = self.outgoing_on_path.get_mut(&path)
+            && buffer.write(buf, stat)
+        {
+            return true;
         }
+        unpinned && self.outgoing.write(buf, stat)
+    }
 
-        buf.write_frame(datagram, stat);
-        true
+    /// Whether a datagram bound to `path` fits in `max_size` bytes of frames
+    pub(super) fn can_send_on_path(&self, path: PathId, max_size: usize) -> bool {
+        self.outgoing_on_path
+            .get(&path)
+            .is_some_and(|buffer| buffer.can_send_1rtt(max_size))
+    }
+
+    /// Whether any datagram is queued that `path` may send
+    pub(super) fn has_outgoing(&self, path: PathId) -> bool {
+        !self.outgoing.is_empty()
+            || self
+                .outgoing_on_path
+                .get(&path)
+                .is_some_and(|buffer| !buffer.is_empty())
+    }
+
+    /// Drops the datagrams bound to a path that has been discarded
+    pub(super) fn discard_path(&mut self, path: PathId) {
+        if let Some(buffer) = self.outgoing_on_path.remove(&path) {
+            trace!(%path, count = buffer.len(), "dropping datagrams bound to discarded path");
+        }
     }
 
     pub(super) fn recv(&mut self) -> Option<Bytes> {
@@ -320,6 +349,60 @@ impl DatagramBuffer {
             .saturating_add(self.queue.len() * size_of::<Datagram>())
     }
 
+    fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
+        while !self.has_send_buffer_space(datagram_len, send_buffer_size) {
+            let Some(prev) = self.pop_front() else {
+                break;
+            };
+            trace!(len = prev.data.len(), "dropping outgoing datagram");
+        }
+    }
+
+    fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
+        let Some(total) = self.memory_used().checked_add(datagram_len) else {
+            return false;
+        };
+
+        total <= send_buffer_size
+    }
+
+    fn drop_oversized(&mut self, max_payload: usize) -> bool {
+        let mut dropped_any = false;
+        self.queue.retain(|datagram| {
+            let result = datagram.data.len() < max_payload;
+            if !result {
+                trace!(
+                    "dropping {} byte datagram violating {} byte limit",
+                    datagram.data.len(),
+                    max_payload
+                );
+                self.payload_bytes -= datagram.data.len();
+                dropped_any = true;
+            }
+            result
+        });
+        dropped_any
+    }
+
+    /// Attempt to write the next datagram frame into `buf`, consuming it
+    ///
+    /// Returns whether a frame was written.
+    fn write<'a, 'b>(&mut self, buf: &mut PacketBuilder<'a, 'b>, stat: &mut FrameStats) -> bool {
+        let Some(datagram) = self.pop_front() else {
+            return false;
+        };
+
+        if buf.frame_space_remaining() < datagram.size(true) {
+            // Future work: we could be more clever about cramming small datagrams into
+            // mostly-full packets when a larger one is queued first
+            self.push_front(datagram);
+            return false;
+        }
+
+        buf.write_frame(datagram, stat);
+        true
+    }
+
     pub(super) fn can_send_1rtt(&self, max_size: usize) -> bool {
         self.queue.front().is_some_and(|x| x.size(true) <= max_size)
     }
@@ -355,7 +438,7 @@ mod tests {
             data: Bytes::from_static(&[0; 2]),
         });
 
-        state.make_space_for(4, 10 + 2 * size_of::<Datagram>());
+        state.outgoing.make_space_for(4, 10 + 2 * size_of::<Datagram>());
 
         assert_eq!(state.outgoing.queue.len(), 1);
         assert_eq!(state.outgoing.queue[0].data.len(), 2);
@@ -370,7 +453,7 @@ mod tests {
         });
         state.outgoing.payload_bytes = usize::MAX - 1;
 
-        state.make_space_for(2, usize::MAX);
+        state.outgoing.make_space_for(2, usize::MAX);
 
         assert!(state.outgoing.is_empty());
         assert_eq!(state.outgoing.payload_bytes, usize::MAX - 2);
@@ -411,4 +494,7 @@ pub enum SendDatagramError {
     /// Send would block
     #[error("datagram send blocked")]
     Blocked(Bytes),
+    /// The path the datagram was bound to is closed or unknown
+    #[error("path closed")]
+    PathClosed,
 }
