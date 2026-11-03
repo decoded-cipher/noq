@@ -425,7 +425,9 @@ mod tests {
             data: Bytes::from_static(&[0; 2]),
         });
 
-        state.outgoing.make_space_for(4, 10 + 2 * size_of::<Datagram>());
+        state
+            .outgoing
+            .make_space_for(4, 10 + 2 * size_of::<Datagram>());
 
         assert_eq!(state.outgoing.queue.len(), 1);
         assert_eq!(state.outgoing.queue[0].data.len(), 2);

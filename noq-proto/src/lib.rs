@@ -57,9 +57,9 @@ pub use crate::connection::{
     Chunk, Chunks, ClosePathError, ClosedPath, ClosedStream, Connection, ConnectionError,
     ConnectionStats, Datagrams, Event, FinishError, FrameStats, MultipathNotNegotiated,
     NetworkChangeHint, PathAbandonReason, PathChoice, PathError, PathEvent, PathId, PathScheduler,
-    PathSchedulerFactory, PathSnapshot, PathStats, PathStatus,
-    ReadError, ReadableError, RecvStream, RttEstimator, SendDatagramError, SendStream,
-    SetPathStatusError, ShouldTransmit, StreamAffinity, StreamEvent, Streams, UdpStats, WriteError,
+    PathSchedulerFactory, PathSnapshot, PathStats, PathStatus, ReadError, ReadableError,
+    RecvStream, RttEstimator, SendDatagramError, SendStream, SetPathStatusError, ShouldTransmit,
+    StreamAffinity, StreamEvent, Streams, UdpStats, WriteError,
 };
 #[cfg(test)]
 use test_strategy::Arbitrary;

@@ -24,10 +24,9 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, FourTuple, Frame, FxHashMap, INITIAL_MTU, Instant, MAX_CID_SIZE,
-    InitialToken, MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore,
-    Transmit,
-    TransportError, TransportErrorCode, VarInt,
+    Dir, Duration, EndpointConfig, FourTuple, Frame, FxHashMap, INITIAL_MTU, InitialToken, Instant,
+    MAX_CID_SIZE, MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY,
+    TokenStore, Transmit, TransportError, TransportErrorCode, VarInt,
     cid_queue::CidQueue,
     config::{ServerConfig, TransportConfig},
     congestion::Controller,
@@ -836,7 +835,10 @@ impl Connection {
     /// The path stays open. Until something sent on it is acknowledged, its losses do not
     /// shrink its congestion window or path MTU.
     pub fn declare_path_lost(&mut self, path_id: PathId, now: Instant) -> Result<(), ClosedPath> {
-        let path = self.paths.get_mut(&path_id).ok_or(ClosedPath { _private: () })?;
+        let path = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(ClosedPath { _private: () })?;
         path.data.outage = true;
         let in_flight_mtu_probe = path.data.mtud.in_flight_mtu_probe();
 
@@ -2361,12 +2363,13 @@ impl Connection {
         connection_close_pending: bool,
         unpinned_data: bool,
     ) -> SendableFrames {
-        let acks_for_other_paths = self.spaces[space_id]
-            .number_spaces
-            .iter()
-            .any(|(&acked, pns)| {
-                acked != path_id && pns.pending_acks.can_send() && !self.carries_own_acks(acked)
-            });
+        let acks_for_other_paths =
+            self.spaces[space_id]
+                .number_spaces
+                .iter()
+                .any(|(&acked, pns)| {
+                    acked != path_id && pns.pending_acks.can_send() && !self.carries_own_acks(acked)
+                });
         let space = &mut self.spaces[space_id];
         let space_has_crypto = self.crypto_state.has_keys(space_id.encryption_level());
 
@@ -7200,7 +7203,12 @@ impl Connection {
     ///
     /// See also [`PacketSpace::can_send`] which keeps track of all other frame types that
     /// may need to be sent.
-    fn can_send_1rtt(&self, path_id: PathId, max_size: usize, unpinned_data: bool) -> SendableFrames {
+    fn can_send_1rtt(
+        &self,
+        path_id: PathId,
+        max_size: usize,
+        unpinned_data: bool,
+    ) -> SendableFrames {
         let network_path = self.path_data(path_id).network_path;
         let probing_frames = self
             .paths

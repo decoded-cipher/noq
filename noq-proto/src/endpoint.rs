@@ -177,7 +177,11 @@ impl Endpoint {
                 dst_cid,
                 version,
             }) => {
-                if self.server_config.as_ref().is_none_or(|config| config.silent) {
+                if self
+                    .server_config
+                    .as_ref()
+                    .is_none_or(|config| config.silent)
+                {
                     debug!("dropping packet with unsupported version");
                     return None;
                 }
@@ -286,7 +290,11 @@ impl Endpoint {
         dst_cid: ConnectionId,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
-        if self.server_config.as_ref().is_some_and(|config| config.silent) {
+        if self
+            .server_config
+            .as_ref()
+            .is_some_and(|config| config.silent)
+        {
             return None;
         }
         if self

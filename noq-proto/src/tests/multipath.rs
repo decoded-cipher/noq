@@ -14,7 +14,9 @@ use crate::{
     ClientConfig, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, FourTuple,
     Instant, LOCAL_CID_COUNT, NetworkChangeHint, PathChoice, PathError, PathId, PathScheduler,
     PathSchedulerFactory, PathSnapshot, PathStatus, RandomConnectionIdGenerator, ServerConfig,
-    Side::{self, *}, TransportConfig, cid_queue::CidQueue,
+    Side::{self, *},
+    TransportConfig,
+    cid_queue::CidQueue,
 };
 use crate::{
     ClosePathError, Dir, Event, PathAbandonReason, PathEvent, SendDatagramError, StreamAffinity,
@@ -2694,7 +2696,8 @@ fn paths_left_out_by_the_scheduler_carry_only_pinned_data() -> TestResult {
     let before = stream_frames_sent(&mut pair, first);
 
     let unpinned = pair.streams(Client).open(Dir::Uni).unwrap();
-    pair.send_stream(Client, unpinned).write(b"waits for a path")?;
+    pair.send_stream(Client, unpinned)
+        .write(b"waits for a path")?;
     pair.drive();
     assert_eq!(stream_frames_sent(&mut pair, first), before);
     assert_eq!(stream_frames_sent(&mut pair, PathId(1)), 0);
@@ -2702,7 +2705,8 @@ fn paths_left_out_by_the_scheduler_carry_only_pinned_data() -> TestResult {
     let pinned = pair.streams(Client).open(Dir::Uni).unwrap();
     pair.send_stream(Client, pinned)
         .set_affinity(StreamAffinity::Sticky(first))?;
-    pair.send_stream(Client, pinned).write(b"pinned data still flows")?;
+    pair.send_stream(Client, pinned)
+        .write(b"pinned data still flows")?;
     pair.drive();
     assert_eq!(stream_frames_sent(&mut pair, first), before + 1);
     Ok(())
@@ -2744,7 +2748,11 @@ fn declaring_an_unknown_path_lost_fails() {
     let _guard = subscribe();
     let mut pair = ConnPair::builder().enable_multipath().connect();
     let now = pair.time;
-    assert!(pair.conn_mut(Client).declare_path_lost(PathId(7), now).is_err());
+    assert!(
+        pair.conn_mut(Client)
+            .declare_path_lost(PathId(7), now)
+            .is_err()
+    );
 }
 
 #[test]
@@ -2764,24 +2772,28 @@ fn peer_backup_status_moves_data_to_other_paths() -> TestResult {
     );
 
     // The client asks the server to avoid the first path.
-    pair.conn_mut(Client).set_path_status(first, PathStatus::Backup)?;
+    pair.conn_mut(Client)
+        .set_path_status(first, PathStatus::Backup)?;
     pair.drive();
     let first_before = pair.path_stats(Server, first).unwrap().frame_tx.stream;
     let second_before = pair.path_stats(Server, second).unwrap().frame_tx.stream;
 
     let stream = pair.streams(Server).open(Dir::Uni).unwrap();
-    pair.send_stream(Server, stream).write(b"sent where the peer prefers")?;
+    pair.send_stream(Server, stream)
+        .write(b"sent where the peer prefers")?;
     pair.send_stream(Server, stream).finish()?;
     pair.drive();
 
-    assert_eq!(pair.path_stats(Server, first).unwrap().frame_tx.stream, first_before);
+    assert_eq!(
+        pair.path_stats(Server, first).unwrap().frame_tx.stream,
+        first_before
+    );
     assert_eq!(
         pair.path_stats(Server, second).unwrap().frame_tx.stream,
         second_before + 1
     );
     Ok(())
 }
-
 
 fn pair_with_two_paths() -> Result<ConnPair, PathError> {
     pair_with_two_paths_and(TransportConfig::default())
@@ -2841,7 +2853,8 @@ fn acks_for_a_backup_path_go_on_another_path() -> TestResult {
     let _guard = subscribe();
     let mut pair = pair_with_two_paths()?;
     let (first, second) = (PathId::ZERO, PathId(1));
-    pair.conn_mut(Client).set_path_status(first, PathStatus::Backup)?;
+    pair.conn_mut(Client)
+        .set_path_status(first, PathStatus::Backup)?;
     pair.drive();
     let first_before = path_acks_sent(&mut pair, Server, first);
     let second_before = path_acks_sent(&mut pair, Server, second);
@@ -2920,7 +2933,8 @@ fn datagrams_bound_to_a_path_are_sent_on_it() -> TestResult {
     let mut pair = pair_with_two_paths()?;
     let (first, second) = (PathId::ZERO, PathId(1));
     // Like sticky streams, bound datagrams ignore the path's backup status.
-    pair.conn_mut(Client).set_path_status(second, PathStatus::Backup)?;
+    pair.conn_mut(Client)
+        .set_path_status(second, PathStatus::Backup)?;
     pair.drive();
     let first_before = datagrams_sent(&mut pair, Client, first);
     let second_before = datagrams_sent(&mut pair, Client, second);
@@ -2990,17 +3004,22 @@ fn datagrams_bound_to_a_closed_path_are_dropped() -> TestResult {
 fn key_updates_and_authentication_failures_are_counted() -> TestResult {
     let _guard = subscribe();
     let mut pair = ConnPair::builder().enable_multipath().connect();
-    let before = (pair.stats(Client).key_updates, pair.stats(Server).key_updates);
+    let before = (
+        pair.stats(Client).key_updates,
+        pair.stats(Server).key_updates,
+    );
 
     pair.conn_mut(Client).force_key_update();
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
-    pair.send_stream(Client, stream).write(b"sent with the new keys")?;
+    pair.send_stream(Client, stream)
+        .write(b"sent with the new keys")?;
     pair.drive();
     assert!(pair.stats(Client).key_updates > before.0);
     assert!(pair.stats(Server).key_updates > before.1);
 
     let failures = pair.stats(Server).authentication_failures;
-    pair.send_stream(Client, stream).write(b"damaged on the way")?;
+    pair.send_stream(Client, stream)
+        .write(b"damaged on the way")?;
     pair.drive_client();
     for inbound in pair.server.inbound.iter_mut() {
         let last = inbound.packet.len() - 1;

@@ -57,9 +57,9 @@ mod encode_decode;
 mod multipath;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod proptests;
-mod silent;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod random_interaction;
+mod silent;
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
