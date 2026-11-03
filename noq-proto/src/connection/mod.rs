@@ -830,6 +830,54 @@ impl Connection {
         self.paths.keys().copied().collect()
     }
 
+    /// Treats every packet in flight on `path_id` as lost, so its data is sent again on
+    /// other paths now rather than after this path's loss detection runs
+    ///
+    /// Loss detection on a path depends on acknowledgements arriving on it, so when a path
+    /// goes silent its in-flight data is only recovered once the path comes back or is
+    /// abandoned. An application that notices sooner, for example because nothing has
+    /// been received on the path for a while or the interface went down, can call this.
+    /// The path stays open and keeps being probed. Its congestion controller sees the loss
+    /// like any other.
+    pub fn declare_path_lost(&mut self, path_id: PathId, now: Instant) -> Result<(), ClosedPath> {
+        let path = self.path(path_id).ok_or(ClosedPath { _private: () })?;
+        let in_flight_mtu_probe = path.mtud.in_flight_mtu_probe();
+
+        let mut size_of_lost_packets = 0u64;
+        let lost_pns: Vec<_> = self.spaces[SpaceId::Data]
+            .for_path(path_id)
+            .sent_packets
+            .iter()
+            .filter(|(pn, _info)| Some(*pn) != in_flight_mtu_probe)
+            .map(|(pn, info)| {
+                size_of_lost_packets += info.size as u64;
+                pn
+            })
+            .collect();
+        if lost_pns.is_empty() {
+            return Ok(());
+        }
+
+        trace!(
+            %path_id,
+            count = lost_pns.len(),
+            lost_bytes = size_of_lost_packets,
+            "in-flight packets declared lost by the application"
+        );
+        self.handle_lost_packets(
+            SpaceId::Data,
+            path_id,
+            now,
+            lost_pns,
+            None,
+            Duration::ZERO,
+            false,
+            size_of_lost_packets,
+        );
+        self.set_loss_detection_timer(now, path_id);
+        Ok(())
+    }
+
     /// Gets the local [`PathStatus`] for a known [`PathId`]
     pub fn path_status(&self, path_id: PathId) -> Result<PathStatus, ClosedPath> {
         self.path(path_id)

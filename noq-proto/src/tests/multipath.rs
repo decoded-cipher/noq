@@ -2709,3 +2709,44 @@ fn paths_left_out_by_the_scheduler_carry_only_pinned_data() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn declared_lost_data_is_sent_again_at_once() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let path = PathId::ZERO;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    const MSG: &[u8] = b"lost on a silent path";
+    pair.send_stream(Client, stream).write(MSG)?;
+    pair.send_stream(Client, stream).finish()?;
+
+    // Send it, and lose it in the network.
+    pair.drive_client();
+    pair.server.inbound.clear();
+    let sent = stream_frames_sent(&mut pair, path);
+    let lost = pair.path_stats(Client, path).unwrap().lost_packets;
+
+    let now = pair.time;
+    pair.conn_mut(Client).declare_path_lost(path, now)?;
+    assert!(pair.path_stats(Client, path).unwrap().lost_packets > lost);
+
+    // Sent again without waiting for a timer.
+    pair.drive_client();
+    assert!(stream_frames_sent(&mut pair, path) > sent);
+
+    pair.drive();
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    let mut recv = pair.recv_stream(Server, stream);
+    let mut chunks = recv.read(true)?;
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes == MSG);
+    let _ = chunks.finalize();
+    Ok(())
+}
+
+#[test]
+fn declaring_an_unknown_path_lost_fails() {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let now = pair.time;
+    assert!(pair.conn_mut(Client).declare_path_lost(PathId(7), now).is_err());
+}
+
