@@ -263,6 +263,10 @@ pub struct PathStats {
     /// If you're interested in the full amount of bytes transmitted, consider looking
     /// at [`ConnectionStats::udp_tx`].
     pub sent_bytes: u64,
+    /// The number of packets sent on this path that have been acknowledged.
+    ///
+    /// The acknowledgements may have arrived on any path.
+    pub acked_packets: u64,
     /// The number of packets lost on this path.
     ///
     /// This counts all packets declared lost, including MTUD probes. More specific counters
@@ -334,6 +338,7 @@ impl core::ops::Add<PathStats> for ConnectionStats {
             rtt: _,
             rtt_variance: _,
             bytes_in_flight: _,
+            acked_packets: _,
             udp_tx,
             udp_rx,
             frame_tx,
@@ -374,6 +379,7 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
             rtt: _,
             rtt_variance: _,
             bytes_in_flight: _,
+            acked_packets: _,
             udp_tx: path_udp_tx,
             udp_rx: path_udp_rx,
             frame_tx: path_frame_tx,
