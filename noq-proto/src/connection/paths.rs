@@ -256,12 +256,8 @@ pub(super) struct PathData {
     ///
     /// [`LossDetection`]: super::timer::PathTimer::LossDetection
     pub(super) pto_count: u32,
-    /// Whether the application declared the path's in-flight packets lost because it
-    /// stopped delivering, and nothing sent on it has been acknowledged since
-    ///
-    /// Losses during an outage say nothing about congestion or the path MTU, so they are
-    /// not used as signals for either. If the path comes back slower, losses after it
-    /// delivers again shrink the congestion window as usual.
+    /// Declared lost with nothing acknowledged since; its losses then signal neither
+    /// congestion nor a smaller path MTU.
     pub(super) outage: bool,
 
     //
@@ -672,9 +668,7 @@ impl PathData {
         self.status.remote_status.map(|(_seq, status)| status)
     }
 
-    /// The status that decides how this endpoint uses the path: backup if either side
-    /// asked for it, since a peer's PATH_STATUS_BACKUP asks that the path only be used when
-    /// no other path is available.
+    /// Backup if either end set it, as the peer's PATH_STATUS_BACKUP asks us to avoid the path.
     pub(crate) fn effective_status(&self) -> PathStatus {
         match (self.local_status(), self.remote_status()) {
             (PathStatus::Available, Some(PathStatus::Backup)) => PathStatus::Backup,

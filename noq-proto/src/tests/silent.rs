@@ -108,7 +108,6 @@ fn silent_server_answers_no_unauthenticated_packet() {
     }
 }
 
-/// Stands in for a MAC over the ClientHello.
 struct Checksum;
 
 impl InitialToken for Checksum {

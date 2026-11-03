@@ -17,8 +17,7 @@ pub struct PathSnapshot {
     pub status: PathStatus,
     /// The status the peer advertised for the path, if it sent one
     pub peer_status: Option<PathStatus>,
-    /// Whether the path may carry application data at all: it has connection IDs, is not
-    /// abandoned, and is validated (or the handshake is still in progress)
+    /// Whether the path may carry application data at all: validated and not abandoned
     pub can_send_data: bool,
     /// Smoothed round-trip time
     pub smoothed_rtt: Duration,
@@ -43,22 +42,15 @@ pub struct PathChoice {
     pub unpinned_data: bool,
 }
 
-/// Decides, on every [`Connection::poll_transmit`](super::Connection::poll_transmit), the
-/// order in which paths are offered data and which of them may carry data that is not
-/// pinned to a particular path
+/// Chooses the order paths are tried in, and which may carry data not pinned to a path
 ///
-/// This replaces the default policy of trying paths in [`PathId`] order and sending
-/// unpinned data only on [`PathStatus::Available`] paths (or on backup paths when no
-/// available path is validated). It only applies once the handshake is complete.
-///
-/// Streams pinned with [`StreamAffinity::Sticky`](crate::StreamAffinity::Sticky),
-/// acknowledgements, path validation and other control frames are not affected, and
-/// congestion control, pacing and anti-amplification limits still apply to every path.
+/// Called on every `poll_transmit` once the handshake is complete. Data pinned to a path,
+/// control frames and congestion control are unaffected.
 pub trait PathScheduler: Send + Sync + fmt::Debug {
-    /// Fills `choices` with a decision per path, in the order the paths should be tried
+    /// Fills the empty `choices` with a decision per path, in the order to try them
     ///
-    /// `choices` is empty when called. Paths that are left out are tried after all listed
-    /// paths and carry no unpinned data. Choices for unknown paths are ignored.
+    /// Paths left out are tried last and carry only pinned data. Choices for unknown paths
+    /// are ignored.
     fn schedule(&mut self, now: Instant, paths: &[PathSnapshot], choices: &mut Vec<PathChoice>);
 }
 

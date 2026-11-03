@@ -181,7 +181,6 @@ pub struct Connection {
     /// deterministically select the next PathId to send on.
     // TODO(flub): well does it really? But deterministic is nice for now.
     paths: BTreeMap<PathId, PathState>,
-    /// Chooses path order and which paths carry unpinned data, if one is configured
     path_scheduler: Option<Box<dyn PathScheduler>>,
     /// Buffers reused by [`Connection::fill_path_order`] on every `poll_transmit`
     path_snapshots: Vec<PathSnapshot>,
@@ -832,18 +831,10 @@ impl Connection {
         self.paths.keys().copied().collect()
     }
 
-    /// Treats every packet in flight on `path_id` as lost, so its data is sent again on
-    /// other paths now rather than after this path's loss detection runs
+    /// Treats every packet in flight on `path_id` as lost, so its data is sent again at once
     ///
-    /// Loss detection on a path depends on acknowledgements arriving on it, so when a path
-    /// goes silent its in-flight data is only recovered once the path comes back or is
-    /// abandoned. An application that notices sooner, for example because nothing has
-    /// been received on the path for a while or the interface went down, can call this.
-    /// The path stays open and keeps being probed.
-    ///
-    /// The path is treated as being in an outage until something sent on it is
-    /// acknowledged: its losses until then do not shrink its congestion window or path MTU,
-    /// so it resumes at its previous rate when it comes back.
+    /// The path stays open. Until something sent on it is acknowledged, its losses do not
+    /// shrink its congestion window or path MTU.
     pub fn declare_path_lost(&mut self, path_id: PathId, now: Instant) -> Result<(), ClosedPath> {
         let path = self.paths.get_mut(&path_id).ok_or(ClosedPath { _private: () })?;
         path.data.outage = true;
@@ -1236,11 +1227,8 @@ impl Connection {
         None
     }
 
-    /// Fills `order` with every path, in the order [`Connection::poll_transmit`] tries them
-    ///
-    /// Each entry carries the configured [`PathScheduler`]'s decision on unpinned data, or
-    /// `None` to keep the default available/backup policy. Without a scheduler, and during
-    /// the handshake, paths are tried in [`PathId`] order.
+    /// Fills `order` with every path in the order to try them, each with the scheduler's
+    /// unpinned-data decision or `None` for the default policy.
     fn fill_path_order(&mut self, now: Instant, order: &mut Vec<(PathId, Option<bool>)>) {
         if self.path_scheduler.is_none() || self.is_handshaking() {
             order.extend(self.paths.keys().map(|&id| (id, None)));
@@ -1372,12 +1360,8 @@ impl Connection {
         }
     }
 
-    /// Whether ACKs for packets received on this path are sent on the path itself
-    ///
-    /// ACKs go on the path they acknowledge, so a path that stops delivering does not take
-    /// the other paths' ACKs with it, and each path's RTT is measured over that path alone.
-    /// The ACKs of a path that cannot carry them, because it is abandoned, not validated,
-    /// or a backup while another path is available, go on any path that can.
+    /// Whether this path carries its own ACKs, so a failing path cannot take other paths'
+    /// ACKs with it and each RTT is measured on its own path.
     fn carries_own_acks(&self, path_id: PathId) -> bool {
         self.paths.contains_key(&path_id) && {
             let info = self.scheduling_info(path_id);
@@ -1385,7 +1369,6 @@ impl Connection {
         }
     }
 
-    /// Whether `path_id` has a lower smoothed RTT than `other`
     fn is_faster(&self, path_id: PathId, other: PathId) -> bool {
         self.path_data(path_id).rtt.get() < self.path_data(other).rtt.get()
     }
@@ -1674,9 +1657,8 @@ impl Connection {
                     // Other space-specific frames are only sent if the path is validated.
                     true
                 } else {
-                    // Connection-level frames we only send if we're the best path for
-                    // SpaceKind::Data frames. Data not pinned to a path is already limited to
-                    // the paths allowed to carry it.
+                    // Connection-level frames only go on the best path for SpaceKind::Data
+                    // frames. Unpinned data is already limited to the paths that may carry it.
                     scheduling_info.can_send_data
                         && (can_send.unpinned_data
                             || (!can_send.is_empty() && scheduling_info.status_allows_data))
@@ -2370,8 +2352,7 @@ impl Connection {
     ///
     /// *packet_size* is the number of bytes available to build the next packet.
     /// *connection_close_pending* indicates whether a CONNECTION_CLOSE frame needs to be
-    /// sent. *unpinned_data* indicates whether this path may carry stream data and datagrams
-    /// that are not pinned to a path.
+    /// sent. *unpinned_data* indicates whether this path may carry data not pinned to a path.
     fn space_can_send(
         &mut self,
         space_id: SpaceId,
@@ -6311,10 +6292,8 @@ impl Connection {
         let is_multipath_negotiated = self.is_multipath_negotiated();
         let space_has_keys = self.crypto_state.has_keys(space_id.encryption_level());
         let is_0rtt = space_id == SpaceId::Data && !space_has_keys;
-        // Besides its own, this packet carries the ACKs of paths that cannot carry theirs,
-        // and new ACKs of slower paths, which reach the peer sooner here than on their own
-        // path. Slower paths still send their ACKs themselves, so losing this path does not
-        // lose them.
+        // Also carry the ACKs of paths that cannot send their own, and new ACKs of slower
+        // paths, which arrive sooner here; those paths still send their own ACKs too.
         let acks_for_other_paths = self.spaces[space_id]
             .number_spaces
             .iter()
@@ -7594,9 +7573,7 @@ struct PathSchedulingInfo {
     ///
     /// Always true during the handshake.
     status_allows_data: bool,
-    /// Whether this path may carry stream data and datagrams that are not pinned to a path.
-    ///
-    /// Follows `status_allows_data` unless a [`PathScheduler`] decides otherwise.
+    /// Whether data not pinned to a path may use this path; a [`PathScheduler`] can override it.
     unpinned_data: bool,
     /// Whether the path may send a CONNECTION_CLOSE frame.
     ///

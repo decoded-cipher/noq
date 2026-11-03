@@ -229,8 +229,7 @@ pub struct PathStats {
     pub rtt_variance: Duration,
     /// Current congestion window of the connection.
     pub cwnd: u64,
-    /// Bytes sent on this path that are still in flight, counted as congestion control
-    /// counts them.
+    /// Bytes in flight on this path, as congestion control counts them.
     pub bytes_in_flight: u64,
     /// Congestion controller's estimate of sustainable path bandwidth, in bits per second.
     ///
@@ -263,9 +262,7 @@ pub struct PathStats {
     /// If you're interested in the full amount of bytes transmitted, consider looking
     /// at [`ConnectionStats::udp_tx`].
     pub sent_bytes: u64,
-    /// The number of packets sent on this path that have been acknowledged.
-    ///
-    /// The acknowledgements may have arrived on any path.
+    /// The number of packets sent on this path that have been acknowledged, on any path.
     pub acked_packets: u64,
     /// The number of packets lost on this path.
     ///

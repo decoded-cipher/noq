@@ -580,7 +580,6 @@ impl Endpoint {
         })
     }
 
-    /// Hands `pending` to the application once its ClientHello is complete
     fn wait_for_client_hello(&mut self, mut pending: PendingClientHello) -> Option<DatagramEvent> {
         let key = (pending.incoming.incoming_idx, pending.incoming.received_at);
         let client_hello = complete_client_hello(&mut pending.crypto);
@@ -1097,17 +1096,14 @@ struct IncomingBuffer {
     pending: Option<PendingClientHello>,
 }
 
-/// Silent mode: a connection attempt whose ClientHello has not fully arrived
 struct PendingClientHello {
     incoming: Incoming,
     crypto: Vec<frame::Crypto>,
     initials: usize,
 }
 
-/// Silent mode: Initials read before giving up on an incomplete ClientHello
 const MAX_INITIALS_PER_CLIENT_HELLO: usize = 3;
 
-/// Silent mode: incomplete ClientHellos held at once
 const MAX_PENDING_CLIENT_HELLOS: usize = 1024;
 
 /// Part of protocol state incoming datagrams can be routed to
@@ -1406,7 +1402,6 @@ impl Incoming {
         self.client_hello.as_deref()
     }
 
-    /// The CRYPTO frames of a later Initial packet of this connection attempt
     fn crypto_frames_of(&self, event: &DatagramConnectionEvent) -> Vec<frame::Crypto> {
         let Ok(packet) = event
             .first_decode
@@ -1532,9 +1527,6 @@ impl Iterator for IncomingAlpns {
     }
 }
 
-/// Sort CRYPTO frames by offset and concatenate into a contiguous `Bytes`
-///
-/// Returns `None` if there are gaps in the stream.
 fn crypto_frames(payload: Bytes) -> Vec<frame::Crypto> {
     let Ok(frames) = frame::Iter::new(payload) else {
         return Vec::new();
@@ -1547,7 +1539,6 @@ fn crypto_frames(payload: Bytes) -> Vec<frame::Crypto> {
         .collect()
 }
 
-/// The ClientHello in `frames`, once all of it has arrived
 fn complete_client_hello(frames: &mut [frame::Crypto]) -> Option<Bytes> {
     let data = assemble_crypto_frames(frames)?;
     if data.first() != Some(&TLS_HANDSHAKE_TYPE_CLIENT_HELLO) || data.len() < 4 {
@@ -1557,6 +1548,9 @@ fn complete_client_hello(frames: &mut [frame::Crypto]) -> Option<Bytes> {
     (data.len() >= len).then(|| data.slice(..len))
 }
 
+/// Sort CRYPTO frames by offset and concatenate into a contiguous `Bytes`
+///
+/// Returns `None` if there are gaps in the stream.
 fn assemble_crypto_frames(frames: &mut [frame::Crypto]) -> Option<Bytes> {
     frames.sort_by_key(|f| f.offset);
     let capacity = frames.iter().map(|f| f.data.len()).sum();

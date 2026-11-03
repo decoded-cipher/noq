@@ -319,10 +319,8 @@ impl ServerConfig {
 
     /// Never reply to a packet before the application accepts its connection
     ///
-    /// No Version Negotiation, Stateless Reset or close is sent in reply to unauthenticated
-    /// packets, and each [`Incoming`][crate::Incoming] waits for its whole ClientHello
-    /// ([`Incoming::client_hello`][crate::Incoming::client_hello]) so the application can
-    /// authenticate it before doing any handshake work.
+    /// Each [`Incoming`][crate::Incoming] then waits for its whole
+    /// [`client_hello`][crate::Incoming::client_hello] so the application can authenticate it.
     pub fn silent(&mut self, silent: bool) -> &mut Self {
         self.silent = silent;
         self

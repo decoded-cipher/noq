@@ -2610,7 +2610,6 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
     Ok(())
 }
 
-/// Lists a fixed set of path choices, whatever the paths look like.
 #[derive(Debug, Clone)]
 struct FixedPathScheduler(Vec<PathChoice>);
 
@@ -2626,7 +2625,6 @@ impl PathSchedulerFactory for FixedPathScheduler {
     }
 }
 
-/// Connects with a fixed path scheduler and opens a second available path.
 fn pair_with_path_scheduler(choices: Vec<PathChoice>) -> Result<ConnPair, PathError> {
     let mut transport = TransportConfig::default();
     transport.path_scheduler_factory(Some(Arc::new(FixedPathScheduler(choices))));
@@ -2720,7 +2718,6 @@ fn declared_lost_data_is_sent_again_at_once() -> TestResult {
     pair.send_stream(Client, stream).write(MSG)?;
     pair.send_stream(Client, stream).finish()?;
 
-    // Send it, and lose it in the network.
     pair.drive_client();
     pair.server.inbound.clear();
     let sent = stream_frames_sent(&mut pair, path);
@@ -2730,7 +2727,6 @@ fn declared_lost_data_is_sent_again_at_once() -> TestResult {
     pair.conn_mut(Client).declare_path_lost(path, now)?;
     assert!(pair.path_stats(Client, path).unwrap().lost_packets > lost);
 
-    // Sent again without waiting for a timer.
     pair.drive_client();
     assert!(stream_frames_sent(&mut pair, path) > sent);
 
@@ -2787,7 +2783,6 @@ fn peer_backup_status_moves_data_to_other_paths() -> TestResult {
 }
 
 
-/// Connects with multipath and opens a second available path.
 fn pair_with_two_paths() -> Result<ConnPair, PathError> {
     pair_with_two_paths_and(TransportConfig::default())
 }
@@ -2815,7 +2810,6 @@ fn path_acks_sent(pair: &mut ConnPair, side: Side, path: PathId) -> u64 {
     pair.path_stats(side, path).unwrap().frame_tx.path_acks
 }
 
-/// Sends a stream pinned to `path` from the client and drives it to the server.
 fn send_on_path(pair: &mut ConnPair, path: PathId) -> TestResult {
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
     pair.send_stream(Client, stream)
@@ -2837,7 +2831,6 @@ fn acks_for_a_path_are_sent_on_that_path() -> TestResult {
 
     send_on_path(&mut pair, second)?;
 
-    // Bundled on the first path, the ACKs would be lost whenever that path is.
     assert_eq!(path_acks_sent(&mut pair, Server, first), first_before);
     assert!(path_acks_sent(&mut pair, Server, second) > second_before);
     Ok(())
@@ -2877,7 +2870,6 @@ fn new_acks_of_a_slower_path_also_go_on_a_faster_path() -> TestResult {
     pair.routes.set_latency(Duration::ZERO);
     let first_before = path_acks_sent(&mut pair, Server, first);
 
-    // Data arrives on the slow path while the server is sending on the fast one.
     let down = pair.streams(Server).open(Dir::Uni).unwrap();
     pair.send_stream(Server, down)
         .set_affinity(StreamAffinity::Sticky(first))?;
@@ -2885,8 +2877,6 @@ fn new_acks_of_a_slower_path_also_go_on_a_faster_path() -> TestResult {
     pair.drive_client();
     send_on_path(&mut pair, second)?;
 
-    // The path's own ACKs are skipped here only because the client acknowledged the
-    // packet that carried them ahead.
     assert!(path_acks_sent(&mut pair, Server, first) > first_before);
     Ok(())
 }
@@ -2900,7 +2890,6 @@ fn declaring_a_path_lost_keeps_its_congestion_window() -> TestResult {
     pair.send_stream(Client, stream).write(&[0; 64 * 1024])?;
     pair.send_stream(Client, stream).finish()?;
 
-    // The path goes silent with data in flight, and stays silent for a while.
     pair.drive_client();
     pair.server.inbound.clear();
     let before = pair.path_stats(Client, path).unwrap();
@@ -2913,7 +2902,6 @@ fn declaring_a_path_lost_keeps_its_congestion_window() -> TestResult {
     assert!(during.lost_packets > before.lost_packets);
     assert_eq!(during.cwnd, before.cwnd);
 
-    // Once it delivers again, nothing lost in the outage counted as congestion.
     pair.drive();
     let after = pair.path_stats(Client, path).unwrap();
     assert_eq!(after.congestion_events, before.congestion_events);
@@ -2969,7 +2957,6 @@ fn each_path_has_its_own_datagram_send_buffer() -> TestResult {
     );
     assert_eq!(pair.datagrams(Client).queued_on_path(first), 3000);
 
-    // Other paths and unbound datagrams are unaffected.
     pair.datagrams(Client)
         .send_on_path(second, datagram.clone(), false)?;
     pair.datagrams(Client).send(datagram, false)?;
@@ -3012,7 +2999,6 @@ fn key_updates_and_authentication_failures_are_counted() -> TestResult {
     assert!(pair.stats(Client).key_updates > before.0);
     assert!(pair.stats(Server).key_updates > before.1);
 
-    // A packet damaged in transit fails authentication and is dropped.
     let failures = pair.stats(Server).authentication_failures;
     pair.send_stream(Client, stream).write(b"damaged on the way")?;
     pair.drive_client();

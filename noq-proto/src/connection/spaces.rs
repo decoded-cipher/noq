@@ -146,8 +146,7 @@ impl PacketSpace {
     /// [`Connection::can_send_1rtt`]: super::Connection::can_send_1rtt
     /// [`Connection::space_can_send`]: super::Connection::space_can_send
     ///
-    /// Only ACKs for `path_id` itself are counted: the connection adds the ACKs of paths
-    /// that cannot carry their own.
+    /// Only ACKs for `path_id` are counted; the connection adds other paths' ACKs.
     pub(super) fn can_send(&self, path_id: PathId, streams: &StreamsState) -> SendableFrames {
         let acks = self
             .number_spaces
@@ -1071,8 +1070,7 @@ pub(super) struct SendableFrames {
     pub(super) space_specific: bool,
     /// Whether there are any other frames to send, these are ack-eliciting.
     pub(super) other: bool,
-    /// Whether there is stream data or datagrams not pinned to a path that this path may
-    /// carry, these are ack-eliciting.
+    /// Whether there is unpinned data this path may carry, these are ack-eliciting.
     pub(super) unpinned_data: bool,
 }
 
@@ -1179,8 +1177,7 @@ pub(super) struct PendingAcks {
     largest_ack_eliciting_packet: Option<u64>,
     /// The largest acknowledged packet number sent in an ACK frame
     largest_acked: Option<u64>,
-    /// The largest acknowledged packet number sent in an ACK frame on a faster path, ahead
-    /// of this path's own ACKs
+    /// Like `largest_acked`, for ACKs sent ahead on a faster path
     largest_sent_ahead: Option<u64>,
 }
 
@@ -1336,8 +1333,6 @@ impl PendingAcks {
     }
 
     /// Should be called when these ACKs were sent ahead on a faster path
-    ///
-    /// The ACKs this space sends on its own path follow their usual schedule.
     pub(super) fn acks_sent_ahead(&mut self) {
         self.largest_sent_ahead = self.largest_ack_eliciting_packet;
     }

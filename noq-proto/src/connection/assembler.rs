@@ -23,7 +23,6 @@ pub(super) struct Assembler {
     /// application, aka the stream offset.
     bytes_read: u64,
     end: u64,
-    /// Bound on the number of distinct spans kept, see [`MAX_CHUNKS`].
     max_chunks: usize,
 }
 
@@ -47,11 +46,7 @@ impl Assembler {
         Self::default()
     }
 
-    /// An assembler for a stream that may buffer up to `receive_window` bytes.
-    ///
-    /// The bound on distinct spans grows with the window, so data that legitimately
-    /// arrives out of order across the whole window (for example when a stream is spread
-    /// over multipath paths with different delays) does not exhaust it.
+    /// Scales the span bound with the window, so multipath reordering is not rejected.
     pub(super) fn with_receive_window(receive_window: u64) -> Self {
         let scaled =
             usize::try_from(receive_window / MIN_WINDOW_BYTES_PER_CHUNK).unwrap_or(usize::MAX);
@@ -444,15 +439,10 @@ fn insert_ordered(data: &mut VecDeque<Buffer>, buffer: Buffer) {
 /// Bound on the number of distinct spans kept for a stream.
 ///
 /// Independent of how much memory those spans over-allocate. A frame is rejected only
-/// if compaction cannot get the count back down to this. Streams with a large receive
-/// window get a proportionally larger bound, see [`MIN_WINDOW_BYTES_PER_CHUNK`].
+/// if compaction cannot get the count back down to this. Large receive windows raise it.
 const MAX_CHUNKS: usize = 1024;
 
-/// Receive-window bytes per allowed span, for windows large enough to raise the bound
-/// above [`MAX_CHUNKS`].
-///
-/// A span costs a fixed amount of bookkeeping once compacted, so allowing one per KiB of
-/// window keeps that overhead a small fraction of the memory the window already permits.
+/// Receive-window bytes per allowed span, so span bookkeeping stays small next to the window.
 const MIN_WINDOW_BYTES_PER_CHUNK: u64 = 1024;
 
 /// Minimum size of a defragmented chunk that is retained without coalescing.
@@ -461,7 +451,6 @@ const MIN_WINDOW_BYTES_PER_CHUNK: u64 = 1024;
 /// being cheap to copy while reducing the overhead of many small buffer nodes.
 const MIN_RETAINED_CHUNK_SIZE: usize = 128;
 
-/// Compaction threshold of an assembler with the default chunk bound.
 #[cfg(test)]
 const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
 

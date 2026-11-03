@@ -30,16 +30,10 @@ impl Datagrams<'_> {
         self.queue(None, data, drop)
     }
 
-    /// Queue an unreliable, unordered datagram to be sent on `path` only
+    /// Queue an unreliable, unordered datagram to be sent on `path` only, whatever its status
     ///
-    /// Unlike datagrams queued with [`Self::send`], the datagram is not subject to the path
-    /// scheduler or to the paths' available/backup status: it is sent on `path` as soon as
-    /// that path can send, ahead of datagrams not bound to a path. Each path has its own send
-    /// buffer of [`TransportConfig::datagram_send_buffer_size`] bytes, so datagrams waiting on
-    /// a slow path never displace those for other paths, and `drop` applies to that buffer as
-    /// in [`Self::send`]. Datagrams still queued when the path is discarded are dropped.
-    ///
-    /// [`TransportConfig::datagram_send_buffer_size`]: crate::TransportConfig::datagram_send_buffer_size
+    /// Each path has its own send buffer, to which `drop` applies as in [`Self::send`].
+    /// Datagrams still queued when the path is discarded are dropped.
     pub fn send_on_path(
         &mut self,
         path: PathId,
@@ -195,8 +189,7 @@ impl Datagrams<'_> {
             .saturating_sub(size_of::<Datagram>())
     }
 
-    /// Payload bytes of the datagrams queued with [`Self::send_on_path`] that are still
-    /// waiting to be sent on `path`
+    /// Payload bytes queued with [`Self::send_on_path`] and not yet sent on `path`
     pub fn queued_on_path(&self, path: PathId) -> usize {
         self.conn
             .datagrams
@@ -209,9 +202,7 @@ impl Datagrams<'_> {
 #[derive(Default)]
 pub(super) struct DatagramState {
     pub(super) incoming: DatagramBuffer,
-    /// Outgoing datagrams any path allowed to carry unpinned data may send
     pub(super) outgoing: DatagramBuffer,
-    /// Outgoing datagrams bound to one path, each path with its own send buffer
     pub(super) outgoing_on_path: FxHashMap<PathId, DatagramBuffer>,
     pub(super) send_blocked: bool,
 }
@@ -261,8 +252,7 @@ impl DatagramState {
         dropped_any
     }
 
-    /// Attempt to write a datagram frame for `path` into `buf`: one bound to the path, or if
-    /// `unpinned` is set, one any path may send
+    /// Attempt to write a datagram frame for `path` into `buf`, preferring one bound to it
     ///
     /// Returns whether a frame was written.
     pub(super) fn write<'a, 'b>(
@@ -280,14 +270,12 @@ impl DatagramState {
         unpinned && self.outgoing.write(buf, stat)
     }
 
-    /// Whether a datagram bound to `path` fits in `max_size` bytes of frames
     pub(super) fn can_send_on_path(&self, path: PathId, max_size: usize) -> bool {
         self.outgoing_on_path
             .get(&path)
             .is_some_and(|buffer| buffer.can_send_1rtt(max_size))
     }
 
-    /// Whether any datagram is queued that `path` may send
     pub(super) fn has_outgoing(&self, path: PathId) -> bool {
         !self.outgoing.is_empty()
             || self
@@ -296,7 +284,6 @@ impl DatagramState {
                 .is_some_and(|buffer| !buffer.is_empty())
     }
 
-    /// Drops the datagrams bound to a path that has been discarded
     pub(super) fn discard_path(&mut self, path: PathId) {
         if let Some(buffer) = self.outgoing_on_path.remove(&path) {
             trace!(%path, count = buffer.len(), "dropping datagrams bound to discarded path");
