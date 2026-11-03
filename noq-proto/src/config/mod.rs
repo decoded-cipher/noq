@@ -228,6 +228,8 @@ pub struct ServerConfig {
     pub(crate) incoming_buffer_size: u64,
     pub(crate) incoming_buffer_size_total: u64,
 
+    pub(crate) silent: bool,
+
     pub(crate) time_source: Arc<dyn TimeSource>,
 }
 
@@ -254,6 +256,8 @@ impl ServerConfig {
             max_incoming: 1 << 16,
             incoming_buffer_size: 10 << 20,
             incoming_buffer_size_total: 100 << 20,
+
+            silent: false,
 
             time_source: Arc::new(StdSystemTime),
         }
@@ -310,6 +314,17 @@ impl ServerConfig {
     /// If the client is able to reach this address, it will switch to it.
     pub fn preferred_address_v6(&mut self, address: Option<SocketAddrV6>) -> &mut Self {
         self.preferred_address_v6 = address;
+        self
+    }
+
+    /// Never reply to a packet before the application accepts its connection
+    ///
+    /// No Version Negotiation, Stateless Reset or close is sent in reply to unauthenticated
+    /// packets, and each [`Incoming`][crate::Incoming] waits for its whole ClientHello
+    /// ([`Incoming::client_hello`][crate::Incoming::client_hello]) so the application can
+    /// authenticate it before doing any handshake work.
+    pub fn silent(&mut self, silent: bool) -> &mut Self {
+        self.silent = silent;
         self
     }
 
@@ -421,6 +436,7 @@ impl fmt::Debug for ServerConfig {
                 "incoming_buffer_size_total",
                 &self.incoming_buffer_size_total,
             )
+            .field("silent", &self.silent)
             // system_time_clock not debug
             .finish_non_exhaustive()
     }

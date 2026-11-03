@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use core::{
     convert::TryFrom,
     fmt, mem,
@@ -51,6 +51,8 @@ pub struct Endpoint {
     /// Buffered Initial and 0-RTT messages for pending incoming connections
     incoming_buffers: Slab<IncomingBuffer>,
     all_incoming_buffers_total_bytes: u64,
+    /// Silent mode: connection attempts waiting for the rest of their ClientHello, oldest first
+    pending_client_hellos: VecDeque<(usize, Instant)>,
 }
 
 impl Endpoint {
@@ -77,6 +79,7 @@ impl Endpoint {
             last_stateless_reset: None,
             incoming_buffers: Slab::new(),
             all_incoming_buffers_total_bytes: 0,
+            pending_client_hellos: VecDeque::new(),
         }
     }
 
@@ -174,7 +177,7 @@ impl Endpoint {
                 dst_cid,
                 version,
             }) => {
-                if self.server_config.is_none() {
+                if self.server_config.as_ref().is_none_or(|config| config.silent) {
                     debug!("dropping packet with unsupported version");
                     return None;
                 }
@@ -219,6 +222,10 @@ impl Endpoint {
                 RouteDatagramTo::Incoming(incoming_idx) => {
                     let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
                     let config = &self.server_config.as_ref().unwrap();
+                    let more_crypto = incoming_buffer
+                        .pending
+                        .as_ref()
+                        .map(|pending| pending.incoming.crypto_frames_of(&event));
 
                     if incoming_buffer
                         .total_bytes
@@ -234,7 +241,10 @@ impl Endpoint {
                         self.all_incoming_buffers_total_bytes += datagram_len as u64;
                     }
 
-                    None
+                    let mut pending = incoming_buffer.pending.take()?;
+                    pending.crypto.extend(more_crypto?);
+                    pending.initials += 1;
+                    self.wait_for_client_hello(pending)
                 }
                 RouteDatagramTo::Connection(ch, _path_id) => Some(DatagramEvent::ConnectionEvent(
                     ch,
@@ -276,6 +286,9 @@ impl Endpoint {
         dst_cid: ConnectionId,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
+        if self.server_config.as_ref().is_some_and(|config| config.silent) {
+            return None;
+        }
         if self
             .last_stateless_reset
             .is_some_and(|last| last + self.config.min_reset_interval > now)
@@ -452,6 +465,12 @@ impl Endpoint {
             return None;
         }
 
+        let silent = server_config.silent;
+        if silent && self.pending_client_hellos.len() >= MAX_PENDING_CLIENT_HELLOS {
+            self.drop_oldest_pending_client_hello();
+        }
+        let server_config = self.server_config.as_ref().unwrap();
+
         // Saturation only happens under heavy load, where deriving initial keys per Initial just to
         // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
         if self.cids_exhausted() || self.incoming_buffers.len() >= server_config.max_incoming {
@@ -476,6 +495,9 @@ impl Endpoint {
         };
 
         if let Err(reason) = self.early_validate_first_packet(header) {
+            if silent {
+                return None;
+            }
             return Some(DatagramEvent::Response(self.initial_close(
                 header.version,
                 network_path,
@@ -509,6 +531,9 @@ impl Endpoint {
             Ok(token) => token,
             Err(InvalidRetryTokenError) => {
                 debug!("rejecting invalid retry token");
+                if server_config.silent {
+                    return None;
+                }
                 return Some(DatagramEvent::Response(self.initial_close(
                     header.version,
                     network_path,
@@ -524,7 +549,7 @@ impl Endpoint {
         self.index
             .insert_initial_incoming(header.dst_cid, incoming_idx);
 
-        Some(DatagramEvent::NewConnection(Incoming {
+        let incoming = Incoming {
             received_at: event.now,
             network_path,
             ecn: event.ecn,
@@ -537,8 +562,64 @@ impl Endpoint {
             crypto,
             token,
             incoming_idx,
+            client_hello: None,
             improper_drop_warner: IncomingImproperDropWarner,
-        }))
+        };
+        if !server_config.silent {
+            return Some(DatagramEvent::NewConnection(incoming));
+        }
+        let crypto = incoming
+            .decrypt()
+            .map(|initial| crypto_frames(initial.0))
+            .unwrap_or_default();
+        self.wait_for_client_hello(PendingClientHello {
+            incoming,
+            crypto,
+            initials: 1,
+        })
+    }
+
+    /// Hands `pending` to the application once its ClientHello is complete
+    fn wait_for_client_hello(&mut self, mut pending: PendingClientHello) -> Option<DatagramEvent> {
+        let key = (pending.incoming.incoming_idx, pending.incoming.received_at);
+        let client_hello = complete_client_hello(&mut pending.crypto);
+        if client_hello.is_some() || pending.initials >= MAX_INITIALS_PER_CLIENT_HELLO {
+            self.pending_client_hellos.retain(|&entry| entry != key);
+        }
+        if let Some(client_hello) = client_hello {
+            pending.incoming.client_hello = Some(client_hello);
+            return Some(DatagramEvent::NewConnection(pending.incoming));
+        }
+        if pending.initials >= MAX_INITIALS_PER_CLIENT_HELLO {
+            debug!("ignoring connection attempt whose ClientHello did not complete");
+            self.ignore(pending.incoming);
+            return None;
+        }
+        if pending.initials == 1 {
+            self.pending_client_hellos.push_back(key);
+        }
+        self.incoming_buffers[key.0].pending = Some(pending);
+        None
+    }
+
+    fn drop_oldest_pending_client_hello(&mut self) {
+        while let Some((idx, received_at)) = self.pending_client_hellos.pop_front() {
+            let pending = self
+                .incoming_buffers
+                .get_mut(idx)
+                .filter(|buffer| {
+                    buffer
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.incoming.received_at == received_at)
+                })
+                .and_then(|buffer| buffer.pending.take());
+            if let Some(pending) = pending {
+                debug!("dropping the oldest incomplete ClientHello");
+                self.ignore(pending.incoming);
+                return;
+            }
+        }
     }
 
     /// Attempt to accept this incoming connection (an error may still occur)
@@ -1012,7 +1093,21 @@ impl fmt::Debug for Endpoint {
 struct IncomingBuffer {
     datagrams: Vec<DatagramConnectionEvent>,
     total_bytes: u64,
+    pending: Option<PendingClientHello>,
 }
+
+/// Silent mode: a connection attempt whose ClientHello has not fully arrived
+struct PendingClientHello {
+    incoming: Incoming,
+    crypto: Vec<frame::Crypto>,
+    initials: usize,
+}
+
+/// Silent mode: Initials read before giving up on an incomplete ClientHello
+const MAX_INITIALS_PER_CLIENT_HELLO: usize = 3;
+
+/// Silent mode: incomplete ClientHellos held at once
+const MAX_PENDING_CLIENT_HELLOS: usize = 1024;
 
 /// Part of protocol state incoming datagrams can be routed to
 #[derive(Copy, Clone, Debug)]
@@ -1260,6 +1355,8 @@ pub struct Incoming {
     token: IncomingToken,
     incoming_idx: usize,
     #[debug(skip)]
+    client_hello: Option<Bytes>,
+    #[debug(skip)]
     improper_drop_warner: IncomingImproperDropWarner,
 }
 
@@ -1296,6 +1393,41 @@ impl Incoming {
     /// The original destination connection ID sent by the client
     pub fn orig_dst_cid(&self) -> ConnectionId {
         self.token.orig_dst_cid
+    }
+
+    /// The token in the client's Initial packet
+    pub fn token(&self) -> &[u8] {
+        &self.packet.header.token
+    }
+
+    /// The client's whole ClientHello, on servers in silent mode
+    pub fn client_hello(&self) -> Option<&[u8]> {
+        self.client_hello.as_deref()
+    }
+
+    /// The CRYPTO frames of a later Initial packet of this connection attempt
+    fn crypto_frames_of(&self, event: &DatagramConnectionEvent) -> Vec<frame::Crypto> {
+        let Ok(packet) = event
+            .first_decode
+            .clone()
+            .finish(Some(&*self.crypto.header.remote))
+        else {
+            return Vec::new();
+        };
+        let Header::Initial(header) = &packet.header else {
+            return Vec::new();
+        };
+        let mut payload = packet.payload;
+        let decrypted = self.crypto.packet.remote.decrypt(
+            PathId::ZERO,
+            header.number.expand(0),
+            &packet.header_data,
+            &mut payload,
+        );
+        match decrypted {
+            Ok(()) => crypto_frames(payload.freeze()),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Decrypt the Initial packet payload
@@ -1402,6 +1534,28 @@ impl Iterator for IncomingAlpns {
 /// Sort CRYPTO frames by offset and concatenate into a contiguous `Bytes`
 ///
 /// Returns `None` if there are gaps in the stream.
+fn crypto_frames(payload: Bytes) -> Vec<frame::Crypto> {
+    let Ok(frames) = frame::Iter::new(payload) else {
+        return Vec::new();
+    };
+    frames
+        .filter_map(|frame| match frame {
+            Ok(frame::Frame::Crypto(crypto)) => Some(crypto),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ClientHello in `frames`, once all of it has arrived
+fn complete_client_hello(frames: &mut [frame::Crypto]) -> Option<Bytes> {
+    let data = assemble_crypto_frames(frames)?;
+    if data.first() != Some(&TLS_HANDSHAKE_TYPE_CLIENT_HELLO) || data.len() < 4 {
+        return None;
+    }
+    let len = 4 + usize::from(data[1]) * 65536 + usize::from(data[2]) * 256 + usize::from(data[3]);
+    (data.len() >= len).then(|| data.slice(..len))
+}
+
 fn assemble_crypto_frames(frames: &mut [frame::Crypto]) -> Option<Bytes> {
     frames.sort_by_key(|f| f.offset);
     let capacity = frames.iter().map(|f| f.data.len()).sum();

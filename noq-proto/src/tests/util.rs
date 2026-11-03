@@ -1293,6 +1293,7 @@ pub(super) enum IncomingConnectionBehavior {
     Reject,
     Retry,
     Wait,
+    Ignore,
 }
 
 pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavior {
@@ -1360,6 +1361,9 @@ impl TestEndpoint {
                             }
                             IncomingConnectionBehavior::Wait => {
                                 self.waiting_incoming.push(incoming);
+                            }
+                            IncomingConnectionBehavior::Ignore => {
+                                self.endpoint.ignore(incoming);
                             }
                         }
                     }
