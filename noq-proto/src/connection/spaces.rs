@@ -145,11 +145,14 @@ impl PacketSpace {
     ///
     /// [`Connection::can_send_1rtt`]: super::Connection::can_send_1rtt
     /// [`Connection::space_can_send`]: super::Connection::space_can_send
+    ///
+    /// Only ACKs for `path_id` itself are counted: the connection adds the ACKs of paths
+    /// that cannot carry their own.
     pub(super) fn can_send(&self, path_id: PathId, streams: &StreamsState) -> SendableFrames {
         let acks = self
             .number_spaces
-            .values()
-            .any(|pns| pns.pending_acks.can_send());
+            .get(&path_id)
+            .is_some_and(|pns| pns.pending_acks.can_send());
         let probing_frames = self
             .number_spaces
             .get(&path_id)
@@ -1176,6 +1179,9 @@ pub(super) struct PendingAcks {
     largest_ack_eliciting_packet: Option<u64>,
     /// The largest acknowledged packet number sent in an ACK frame
     largest_acked: Option<u64>,
+    /// The largest acknowledged packet number sent in an ACK frame on a faster path, ahead
+    /// of this path's own ACKs
+    largest_sent_ahead: Option<u64>,
 }
 
 impl PendingAcks {
@@ -1191,6 +1197,7 @@ impl PendingAcks {
             largest_packet: Default::default(),
             largest_ack_eliciting_packet: Default::default(),
             largest_acked: Default::default(),
+            largest_sent_ahead: Default::default(),
         }
     }
 
@@ -1326,6 +1333,18 @@ impl PendingAcks {
         self.non_ack_eliciting_since_last_ack_sent = 0;
         self.earliest_ack_eliciting_since_last_ack_sent = None;
         self.largest_acked = self.largest_ack_eliciting_packet;
+    }
+
+    /// Should be called when these ACKs were sent ahead on a faster path
+    ///
+    /// The ACKs this space sends on its own path follow their usual schedule.
+    pub(super) fn acks_sent_ahead(&mut self) {
+        self.largest_sent_ahead = self.largest_ack_eliciting_packet;
+    }
+
+    /// Whether ack-eliciting packets arrived since ACKs were last sent ahead on a faster path
+    pub(super) fn can_send_ahead(&self) -> bool {
+        !self.ranges.is_empty() && self.largest_ack_eliciting_packet > self.largest_sent_ahead
     }
 
     /// Insert one packet that needs to be acknowledged

@@ -1366,6 +1366,24 @@ impl Connection {
         }
     }
 
+    /// Whether ACKs for packets received on this path are sent on the path itself
+    ///
+    /// ACKs go on the path they acknowledge, so a path that stops delivering does not take
+    /// the other paths' ACKs with it, and each path's RTT is measured over that path alone.
+    /// The ACKs of a path that cannot carry them, because it is abandoned, not validated,
+    /// or a backup while another path is available, go on any path that can.
+    fn carries_own_acks(&self, path_id: PathId) -> bool {
+        self.paths.contains_key(&path_id) && {
+            let info = self.scheduling_info(path_id);
+            info.can_send_data && info.status_allows_data
+        }
+    }
+
+    /// Whether `path_id` has a lower smoothed RTT than `other`
+    fn is_faster(&self, path_id: PathId, other: PathId) -> bool {
+        self.path_data(path_id).rtt.get() < self.path_data(other).rtt.get()
+    }
+
     fn build_transmit(&mut self, path_id: PathId, transmit: TransmitBuf<'_>) -> Transmit {
         debug_assert!(
             !transmit.is_empty(),
@@ -1895,13 +1913,17 @@ impl Connection {
                 pad_datagram |= PadDatagram::ToMinMtu;
             }
 
-            for path_id in builder.sent_frames().largest_acked.keys() {
-                self.spaces[space_id]
-                    .for_path(*path_id)
-                    .pending_acks
-                    .acks_sent();
+            for &acked in builder.sent_frames().largest_acked.keys() {
+                let ahead_of_own = acked != path_id && self.carries_own_acks(acked);
+                let pending_acks = &mut self.spaces[space_id].for_path(acked).pending_acks;
+                if ahead_of_own {
+                    // The path's own ACKs still follow on that path.
+                    pending_acks.acks_sent_ahead();
+                    continue;
+                }
+                pending_acks.acks_sent();
                 self.timers.stop(
-                    Timer::PerPath(*path_id, PathTimer::MaxAckDelay),
+                    Timer::PerPath(acked, PathTimer::MaxAckDelay),
                     self.qlog.with_time(now),
                 );
             }
@@ -2352,6 +2374,12 @@ impl Connection {
         connection_close_pending: bool,
         unpinned_data: bool,
     ) -> SendableFrames {
+        let acks_for_other_paths = self.spaces[space_id]
+            .number_spaces
+            .iter()
+            .any(|(&acked, pns)| {
+                acked != path_id && pns.pending_acks.can_send() && !self.carries_own_acks(acked)
+            });
         let space = &mut self.spaces[space_id];
         let space_has_crypto = self.crypto_state.has_keys(space_id.encryption_level());
 
@@ -2365,6 +2393,7 @@ impl Connection {
         }
 
         let mut can_send = space.can_send(path_id, &self.streams);
+        can_send.acks |= acks_for_other_paths;
 
         // Check for 1RTT space.
         if space_id == SpaceId::Data {
@@ -6250,6 +6279,25 @@ impl Connection {
         let is_multipath_negotiated = self.is_multipath_negotiated();
         let space_has_keys = self.crypto_state.has_keys(space_id.encryption_level());
         let is_0rtt = space_id == SpaceId::Data && !space_has_keys;
+        // Besides its own, this packet carries the ACKs of paths that cannot carry theirs,
+        // and new ACKs of slower paths, which reach the peer sooner here than on their own
+        // path. Slower paths still send their ACKs themselves, so losing this path does not
+        // lose them.
+        let acks_for_other_paths = self.spaces[space_id]
+            .number_spaces
+            .iter()
+            .filter(|&(&acked, pns)| {
+                let pending = &pns.pending_acks;
+                acked != path_id
+                    && (pending.can_send() || pending.can_send_ahead())
+                    && if self.carries_own_acks(acked) {
+                        pending.can_send_ahead() && self.is_faster(path_id, acked)
+                    } else {
+                        pending.can_send()
+                    }
+            })
+            .map(|(&acked, _)| acked)
+            .collect::<Vec<_>>();
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
         let space = &mut self.spaces[space_id];
         let path = &mut self.paths.get_mut(&path_id).expect("known path").data;
@@ -6292,17 +6340,19 @@ impl Connection {
             && scheduling_info.can_send_data
             && scheduling_info.status_allows_data
         {
-            for path_id in space
+            let own_acks = space
                 .number_spaces
-                .iter_mut()
-                .filter(|(_, pns)| pns.pending_acks.can_send())
-                .map(|(&path_id, _)| path_id)
-                .collect::<Vec<_>>()
+                .get(&path_id)
+                .is_some_and(|pns| pns.pending_acks.can_send());
+            for acked in own_acks
+                .then_some(path_id)
+                .into_iter()
+                .chain(acks_for_other_paths)
             {
                 Self::populate_acks(
                     now,
                     self.receiving_ecn,
-                    path_id,
+                    acked,
                     space_id,
                     space,
                     is_multipath_negotiated,

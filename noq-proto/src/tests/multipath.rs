@@ -13,7 +13,7 @@ use crate::{
     ClientConfig, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, FourTuple,
     Instant, LOCAL_CID_COUNT, NetworkChangeHint, PathChoice, PathError, PathId, PathScheduler,
     PathSchedulerFactory, PathSnapshot, PathStatus, RandomConnectionIdGenerator, ServerConfig,
-    Side::*, TransportConfig, cid_queue::CidQueue,
+    Side::{self, *}, TransportConfig, cid_queue::CidQueue,
 };
 use crate::{
     ClosePathError, Dir, Event, PathAbandonReason, PathEvent, StreamAffinity, StreamEvent,
@@ -2785,3 +2785,100 @@ fn peer_backup_status_moves_data_to_other_paths() -> TestResult {
     Ok(())
 }
 
+
+/// Connects with multipath and opens a second available path.
+fn pair_with_two_paths() -> Result<ConnPair, PathError> {
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let server_addr = pair.routes.public_server_addr();
+    let second = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    assert_matches!(
+        pair.poll(Client),
+        Some(Event::Path(PathEvent::Established { id })) if id == second
+    );
+    Ok(pair)
+}
+
+fn path_acks_sent(pair: &mut ConnPair, side: Side, path: PathId) -> u64 {
+    pair.path_stats(side, path).unwrap().frame_tx.path_acks
+}
+
+/// Sends a stream pinned to `path` from the client and drives it to the server.
+fn send_on_path(pair: &mut ConnPair, path: PathId) -> TestResult {
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream)
+        .set_affinity(StreamAffinity::Sticky(path))?;
+    pair.send_stream(Client, stream).write(b"acknowledge me")?;
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive();
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    Ok(())
+}
+
+#[test]
+fn acks_for_a_path_are_sent_on_that_path() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = pair_with_two_paths()?;
+    let (first, second) = (PathId::ZERO, PathId(1));
+    let first_before = path_acks_sent(&mut pair, Server, first);
+    let second_before = path_acks_sent(&mut pair, Server, second);
+
+    send_on_path(&mut pair, second)?;
+
+    // Bundled on the first path, the ACKs would be lost whenever that path is.
+    assert_eq!(path_acks_sent(&mut pair, Server, first), first_before);
+    assert!(path_acks_sent(&mut pair, Server, second) > second_before);
+    Ok(())
+}
+
+#[test]
+fn acks_for_a_backup_path_go_on_another_path() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = pair_with_two_paths()?;
+    let (first, second) = (PathId::ZERO, PathId(1));
+    pair.conn_mut(Client).set_path_status(first, PathStatus::Backup)?;
+    pair.drive();
+    let first_before = path_acks_sent(&mut pair, Server, first);
+    let second_before = path_acks_sent(&mut pair, Server, second);
+
+    send_on_path(&mut pair, first)?;
+
+    assert_eq!(path_acks_sent(&mut pair, Server, first), first_before);
+    assert!(path_acks_sent(&mut pair, Server, second) > second_before);
+    Ok(())
+}
+
+#[test]
+fn new_acks_of_a_slower_path_also_go_on_a_faster_path() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let (first, second) = (PathId::ZERO, PathId(1));
+    // The second path's RTT is measured while the network is slow.
+    pair.routes.set_latency(Duration::from_millis(50));
+    let server_addr = pair.routes.public_server_addr();
+    pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    pair.routes.set_latency(Duration::ZERO);
+    let first_before = path_acks_sent(&mut pair, Server, first);
+
+    // Data arrives on the slow path while the server is sending on the fast one.
+    let down = pair.streams(Server).open(Dir::Uni).unwrap();
+    pair.send_stream(Server, down)
+        .set_affinity(StreamAffinity::Sticky(first))?;
+    pair.send_stream(Server, down).write(b"carries the ACKs")?;
+    pair.drive_client();
+    send_on_path(&mut pair, second)?;
+
+    // The path's own ACKs are skipped here only because the client acknowledged the
+    // packet that carried them ahead.
+    assert!(path_acks_sent(&mut pair, Server, first) > first_before);
+    Ok(())
+}
