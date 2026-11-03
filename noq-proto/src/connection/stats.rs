@@ -225,8 +225,13 @@ pub struct PathStats {
     pub frame_tx: FrameStats,
     /// Statistics about frames received on this path.
     pub frame_rx: FrameStats,
+    /// Round-trip time variation.
+    pub rtt_variance: Duration,
     /// Current congestion window of the connection.
     pub cwnd: u64,
+    /// Bytes sent on this path that are still in flight, counted as congestion control
+    /// counts them.
+    pub bytes_in_flight: u64,
     /// Congestion controller's estimate of sustainable path bandwidth, in bits per second.
     ///
     /// `None` when the congestion controller does not provide an estimate.
@@ -327,6 +332,8 @@ impl core::ops::Add<PathStats> for ConnectionStats {
         // rtt, cwnd and current_mtu fields.
         let PathStats {
             rtt: _,
+            rtt_variance: _,
+            bytes_in_flight: _,
             udp_tx,
             udp_rx,
             frame_tx,
@@ -365,6 +372,8 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
         // rtt, cwnd and current_mtu fields.
         let PathStats {
             rtt: _,
+            rtt_variance: _,
+            bytes_in_flight: _,
             udp_tx: path_udp_tx,
             udp_rx: path_udp_rx,
             frame_tx: path_frame_tx,

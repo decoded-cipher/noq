@@ -2840,7 +2840,9 @@ impl Connection {
         let path = self.paths.get(&path_id)?;
         let mut stats = self.path_stats.get(path_id).unwrap_or_default();
         stats.rtt = path.data.rtt.get();
+        stats.rtt_variance = path.data.rtt.var();
         stats.cwnd = path.data.congestion.window();
+        stats.bytes_in_flight = path.data.in_flight.bytes;
         stats.bandwidth_estimate = path.data.congestion.metrics().bandwidth_estimate;
         stats.current_mtu = path.data.mtud.current_mtu();
         Some(stats)
