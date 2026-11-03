@@ -256,6 +256,13 @@ pub(super) struct PathData {
     ///
     /// [`LossDetection`]: super::timer::PathTimer::LossDetection
     pub(super) pto_count: u32,
+    /// Whether the application declared the path's in-flight packets lost because it
+    /// stopped delivering, and nothing sent on it has been acknowledged since
+    ///
+    /// Losses during an outage say nothing about congestion or the path MTU, so they are
+    /// not used as signals for either. If the path comes back slower, losses after it
+    /// delivers again shrink the congestion window as usual.
+    pub(super) outage: bool,
 
     //
     // Per-path idle & keep alive
@@ -355,6 +362,7 @@ impl PathData {
             status: Default::default(),
             first_packet: None,
             pto_count: 0,
+            outage: false,
             idle_timeout: config.default_path_max_idle_timeout,
             keep_alive: config.default_path_keep_alive_interval,
             permit_idle_reset: true,
@@ -403,6 +411,7 @@ impl PathData {
             status: prev.status.clone(),
             first_packet: None,
             pto_count: 0,
+            outage: false,
             idle_timeout: prev.idle_timeout,
             keep_alive: prev.keep_alive,
             permit_idle_reset: true,

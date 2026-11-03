@@ -837,11 +837,15 @@ impl Connection {
     /// goes silent its in-flight data is only recovered once the path comes back or is
     /// abandoned. An application that notices sooner, for example because nothing has
     /// been received on the path for a while or the interface went down, can call this.
-    /// The path stays open and keeps being probed. Its congestion controller sees the loss
-    /// like any other.
+    /// The path stays open and keeps being probed.
+    ///
+    /// The path is treated as being in an outage until something sent on it is
+    /// acknowledged: its losses until then do not shrink its congestion window or path MTU,
+    /// so it resumes at its previous rate when it comes back.
     pub fn declare_path_lost(&mut self, path_id: PathId, now: Instant) -> Result<(), ClosedPath> {
-        let path = self.path(path_id).ok_or(ClosedPath { _private: () })?;
-        let in_flight_mtu_probe = path.mtud.in_flight_mtu_probe();
+        let path = self.paths.get_mut(&path_id).ok_or(ClosedPath { _private: () })?;
+        path.data.outage = true;
+        let in_flight_mtu_probe = path.data.mtud.in_flight_mtu_probe();
 
         let mut size_of_lost_packets = 0u64;
         let lost_pns: Vec<_> = self.spaces[SpaceId::Data]
@@ -3248,6 +3252,8 @@ impl Connection {
 
         // Must be called before crypto/pto_count are clobbered
         self.detect_lost_packets(now, space, path, true);
+        // Losses detected by this ACK may still date from an outage; later ones do not.
+        self.path_data_mut(path).outage = false;
 
         // If the peer did not complete the handshake address validation the ACK could be
         // spoofed, e.g. in the Initial space. Setting the pto_count back to 0 removes the
@@ -3689,8 +3695,10 @@ impl Connection {
                 self.spaces[pn_space].pending |= info.retransmits;
                 let path = self.path_data_mut(path_id);
                 path.pending |= info.path_retransmits;
-                path.mtud.on_non_probe_lost(packet, info.size);
-                path.congestion.on_packet_lost(info.size, packet, now);
+                if !path.outage {
+                    path.mtud.on_non_probe_lost(packet, info.size);
+                    path.congestion.on_packet_lost(info.size, packet, now);
+                }
 
                 self.spaces[pn_space].for_path(path_id).lost_packets.insert(
                     packet,
@@ -3713,11 +3721,11 @@ impl Connection {
                 self.path_stats.get_mut(path_id).black_holes_detected += 1;
             }
 
-            // Don't apply congestion penalty for lost ack-only packets
-            let lost_ack_eliciting =
-                old_bytes_in_flight != self.path_data_mut(path_id).in_flight.bytes;
+            // Don't apply congestion penalty for lost ack-only packets, or during an outage
+            let path = self.path_data(path_id);
+            let lost_ack_eliciting = old_bytes_in_flight != path.in_flight.bytes;
 
-            if lost_ack_eliciting {
+            if lost_ack_eliciting && !path.outage {
                 self.path_stats.get_mut(path_id).congestion_events += 1;
                 self.path_data_mut(path_id).congestion.on_congestion_event(
                     now,

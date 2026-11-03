@@ -2882,3 +2882,34 @@ fn new_acks_of_a_slower_path_also_go_on_a_faster_path() -> TestResult {
     assert!(path_acks_sent(&mut pair, Server, first) > first_before);
     Ok(())
 }
+
+#[test]
+fn declaring_a_path_lost_keeps_its_congestion_window() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let path = PathId::ZERO;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(&[0; 64 * 1024])?;
+    pair.send_stream(Client, stream).finish()?;
+
+    // The path goes silent with data in flight, and stays silent for a while.
+    pair.drive_client();
+    pair.server.inbound.clear();
+    let before = pair.path_stats(Client, path).unwrap();
+    let now = pair.time;
+    pair.conn_mut(Client).declare_path_lost(path, now)?;
+    for _ in 0..5 {
+        pair.blackhole_step(true, false);
+    }
+    let during = pair.path_stats(Client, path).unwrap();
+    assert!(during.lost_packets > before.lost_packets);
+    assert_eq!(during.cwnd, before.cwnd);
+
+    // Once it delivers again, nothing lost in the outage counted as congestion.
+    pair.drive();
+    let after = pair.path_stats(Client, path).unwrap();
+    assert_eq!(after.congestion_events, before.congestion_events);
+    assert!(after.cwnd >= before.cwnd);
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    Ok(())
+}
