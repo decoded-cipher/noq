@@ -25,7 +25,8 @@ use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
     Dir, Duration, EndpointConfig, FourTuple, Frame, FxHashMap, INITIAL_MTU, Instant, MAX_CID_SIZE,
-    MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
+    InitialToken, MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore,
+    Transmit,
     TransportError, TransportErrorCode, VarInt,
     cid_queue::CidQueue,
     config::{ServerConfig, TransportConfig},
@@ -465,6 +466,7 @@ impl Connection {
         if side.is_client() {
             // Kick off the connection
             this.write_crypto();
+            this.make_initial_token();
             this.init_0rtt(now);
         }
         this.qlog
@@ -4290,6 +4292,25 @@ impl Connection {
         Ok(())
     }
 
+    fn make_initial_token(&mut self) {
+        let ConnectionSide::Client {
+            token,
+            initial_token: Some(initial_token),
+            server_name,
+            ..
+        } = &mut self.side
+        else {
+            return;
+        };
+        if let Some(client_hello) = self
+            .state
+            .as_handshake()
+            .and_then(|hs| hs.client_hello.as_ref())
+        {
+            *token = initial_token.token(server_name, client_hello);
+        }
+    }
+
     fn write_crypto(&mut self) {
         loop {
             let space = self.highest_space;
@@ -7599,6 +7620,7 @@ enum ConnectionSide {
         /// Sent in every outgoing Initial packet. Always empty after Initial keys are discarded
         token: Bytes,
         token_store: Arc<dyn TokenStore>,
+        initial_token: Option<Arc<dyn InitialToken>>,
         server_name: String,
     },
     Server {
@@ -7628,10 +7650,15 @@ impl From<SideArgs> for ConnectionSide {
         match side {
             SideArgs::Client {
                 token_store,
+                initial_token,
                 server_name,
             } => Self::Client {
-                token: token_store.take(&server_name).unwrap_or_default(),
+                token: match initial_token {
+                    Some(_) => Bytes::new(),
+                    None => token_store.take(&server_name).unwrap_or_default(),
+                },
                 token_store,
+                initial_token,
                 server_name,
             },
             SideArgs::Server {
@@ -7647,6 +7674,7 @@ impl From<SideArgs> for ConnectionSide {
 pub(crate) enum SideArgs {
     Client {
         token_store: Arc<dyn TokenStore>,
+        initial_token: Option<Arc<dyn InitialToken>>,
         server_name: String,
     },
     Server {

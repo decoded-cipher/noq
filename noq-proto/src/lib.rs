@@ -114,7 +114,9 @@ pub use crate::cid_generator::{
 
 mod token;
 use token::ResetToken;
-pub use token::{NoneTokenLog, NoneTokenStore, TokenLog, TokenReuseError, TokenStore};
+pub use token::{
+    InitialToken, NoneTokenLog, NoneTokenStore, TokenLog, TokenReuseError, TokenStore,
+};
 
 mod address_discovery;
 

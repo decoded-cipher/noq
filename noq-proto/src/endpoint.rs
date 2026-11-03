@@ -390,6 +390,7 @@ impl Endpoint {
             config.transport,
             SideArgs::Client {
                 token_store: config.token_store,
+                initial_token: config.initial_token,
                 server_name: server_name.into(),
             },
             &params,

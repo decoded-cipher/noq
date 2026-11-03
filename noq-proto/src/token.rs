@@ -92,6 +92,15 @@ pub trait TokenStore: Send + Sync {
     fn take(&self, server_name: &str) -> Option<Bytes>;
 }
 
+/// Makes the token a client sends in its Initial packets from its ClientHello
+///
+/// Lets a server authenticate a connection attempt, bound to its exact ClientHello, before it
+/// replies at all (see [`ServerConfig::silent`][crate::ServerConfig::silent]).
+pub trait InitialToken: Send + Sync {
+    /// The token for a connection to `server_name` whose ClientHello is `client_hello`
+    fn token(&self, server_name: &str, client_hello: &[u8]) -> Bytes;
+}
+
 /// Null implementation of [`TokenStore`], which does not store any tokens
 pub struct NoneTokenStore;
 

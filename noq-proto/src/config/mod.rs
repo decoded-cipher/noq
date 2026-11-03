@@ -19,7 +19,7 @@ use crate::NoneTokenLog;
 use crate::crypto::rustls::{QuicServerConfig, configured_provider};
 use crate::{
     DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, SystemTime,
-    TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
+    InitialToken, TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
     shared::ConnectionId,
@@ -571,6 +571,8 @@ pub struct ClientConfig {
     /// Validation token store to use
     pub(crate) token_store: Arc<dyn TokenStore>,
 
+    pub(crate) initial_token: Option<Arc<dyn InitialToken>>,
+
     /// Provider that populates the destination connection ID of Initial Packets
     pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
 
@@ -585,6 +587,7 @@ impl ClientConfig {
             transport: Default::default(),
             crypto,
             token_store: Arc::new(TokenMemoryCache::default()),
+            initial_token: None,
             initial_dst_cid_provider: Arc::new(|| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
@@ -622,6 +625,12 @@ impl ClientConfig {
         self
     }
 
+    /// Make the Initial token from the ClientHello, instead of taking one from the token store
+    pub fn initial_token(&mut self, initial_token: Arc<dyn InitialToken>) -> &mut Self {
+        self.initial_token = Some(initial_token);
+        self
+    }
+
     /// Set the QUIC version to use
     pub fn version(&mut self, version: u32) -> &mut Self {
         self.version = version;
@@ -655,6 +664,7 @@ impl fmt::Debug for ClientConfig {
             .field("transport", &self.transport)
             // crypto not debug
             // token_store not debug
+            // initial_token not debug
             .field("version", &self.version)
             .finish_non_exhaustive()
     }

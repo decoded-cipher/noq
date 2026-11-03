@@ -3,14 +3,15 @@
 use alloc::{boxed::Box, rc::Rc, sync::Arc, vec, vec::Vec};
 use core::cell::RefCell;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 
 use super::util::{
     IncomingConnectionBehavior, Pair, client_crypto_with_alpn, server_config,
     server_crypto_with_alpn, subscribe,
 };
 use crate::{
-    ClientConfig, DatagramEvent, EndpointConfig, FourTuple, RandomConnectionIdGenerator, ServerConfig,
+    ClientConfig, DatagramEvent, EndpointConfig, FourTuple, InitialToken,
+    RandomConnectionIdGenerator, ServerConfig,
 };
 
 /// Enough ALPN protocols that the ClientHello spans two Initial packets.
@@ -105,4 +106,33 @@ fn silent_server_answers_no_unauthenticated_packet() {
         let expected = if silent { 0 } else { probes().len() };
         assert_eq!(replies, expected, "silent: {silent}");
     }
+}
+
+/// Stands in for a MAC over the ClientHello.
+struct Checksum;
+
+impl InitialToken for Checksum {
+    fn token(&self, _server_name: &str, client_hello: &[u8]) -> Bytes {
+        let sum = client_hello.iter().map(|&b| u32::from(b)).sum::<u32>();
+        Bytes::copy_from_slice(&sum.to_be_bytes())
+    }
+}
+
+#[test]
+fn client_token_is_made_from_its_client_hello() {
+    let _guard = subscribe();
+    let mut pair = silent_pair();
+    let matched = Rc::new(RefCell::new(None));
+    let record = matched.clone();
+    pair.server.handle_incoming = Box::new(move |incoming| {
+        let expected = Checksum.token("", incoming.client_hello().unwrap());
+        *record.borrow_mut() = Some(incoming.token() == &expected[..]);
+        IncomingConnectionBehavior::Accept
+    });
+
+    let mut config = client_config();
+    config.initial_token(Arc::new(Checksum));
+    pair.connect_with(config);
+
+    assert_eq!(*matched.borrow(), Some(true));
 }
