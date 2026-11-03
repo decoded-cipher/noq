@@ -99,6 +99,16 @@ impl Incoming {
         self.0.as_ref().unwrap().inner.orig_dst_cid()
     }
 
+    /// The token in the client's Initial packet
+    pub fn token(&self) -> &[u8] {
+        self.0.as_ref().map_or(&[], |state| state.inner.token())
+    }
+
+    /// The client's whole ClientHello, on servers in silent mode
+    pub fn client_hello(&self) -> Option<&[u8]> {
+        self.0.as_ref()?.inner.client_hello()
+    }
+
     /// Decrypt the Initial packet payload
     ///
     /// This clones and decrypts the packet payload (~1200 bytes).

@@ -31,9 +31,9 @@ use crate::{
     udp_transmit,
 };
 use proto::{
-    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, FourTuple, PathError,
-    PathEvent, PathId, PathStats, PathStatus, Side, StreamEvent, StreamId, TransportError,
-    TransportErrorCode, congestion::Controller, n0_nat_traversal,
+    ClosedPath, ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, FourTuple,
+    PathError, PathEvent, PathId, PathStats, PathStatus, Side, StreamEvent, StreamId,
+    TransportError, TransportErrorCode, congestion::Controller, n0_nat_traversal,
 };
 
 /// In-progress connection attempt future
@@ -804,6 +804,24 @@ impl Connection {
     /// Returns path statistics
     pub fn path_stats(&self, path_id: PathId) -> Option<PathStats> {
         self.0.lock_without_waking("path_stats").path_stats(path_id)
+    }
+
+    /// The paths that currently exist
+    pub fn paths(&self) -> Vec<PathId> {
+        self.0.lock_without_waking("paths").inner.paths()
+    }
+
+    /// Treats every packet in flight on a path as lost, see
+    /// [`proto::Connection::declare_path_lost`]
+    pub fn declare_path_lost(&self, path_id: PathId) -> Result<(), ClosedPath> {
+        let mut state = self.0.lock_and_wake("declare_path_lost");
+        let now = state.runtime.now();
+        state.inner.declare_path_lost(path_id, now)
+    }
+
+    /// Sends an ACK-eliciting packet on a path
+    pub fn ping_path(&self, path_id: PathId) -> Result<(), ClosedPath> {
+        self.0.lock_and_wake("ping_path").inner.ping_path(path_id)
     }
 
     /// Current state of the congestion control algorithm, for debugging purposes
