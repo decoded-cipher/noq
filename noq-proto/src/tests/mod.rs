@@ -5572,3 +5572,26 @@ fn qlog_packet_lost_trigger() {
         ]
     );
 }
+
+#[test]
+fn connect_from_sends_from_its_local_ip() {
+    let _guard = subscribe();
+    let mut client = Endpoint::new(Default::default(), None, true);
+    let local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+    let remote = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 1), 4433));
+    let now = Instant::now();
+    let (_, mut conn) = client
+        .connect_from(
+            now,
+            client_config(),
+            FourTuple::new(remote, Some(local_ip)),
+            "localhost",
+        )
+        .unwrap();
+
+    let transmit = conn
+        .poll_transmit(now, NonZeroUsize::MIN, &mut Vec::new())
+        .unwrap();
+    assert_eq!(transmit.destination, remote);
+    assert_eq!(transmit.src_ip, Some(local_ip));
+}

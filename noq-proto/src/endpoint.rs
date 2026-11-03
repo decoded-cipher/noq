@@ -356,6 +356,22 @@ impl Endpoint {
         remote: SocketAddr,
         server_name: &str,
     ) -> Result<(ConnectionHandle, Connection), ConnectError> {
+        let network_path = FourTuple {
+            remote,
+            local_ip: None,
+        };
+        self.connect_from(now, config, network_path, server_name)
+    }
+
+    /// Initiate a connection over `network_path`, sending from its local IP if it has one
+    pub fn connect_from(
+        &mut self,
+        now: Instant,
+        config: ClientConfig,
+        network_path: FourTuple,
+        server_name: &str,
+    ) -> Result<(ConnectionHandle, Connection), ConnectError> {
+        let remote = network_path.remote;
         if self.cids_exhausted() {
             return Err(ConnectError::CidsExhausted);
         }
@@ -389,10 +405,7 @@ impl Endpoint {
             remote_id,
             local_cid,
             remote_id,
-            FourTuple {
-                remote,
-                local_ip: None,
-            },
+            network_path,
             now,
             tls,
             config.transport,

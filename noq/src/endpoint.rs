@@ -238,6 +238,22 @@ impl Endpoint {
         addr: SocketAddr,
         server_name: &str,
     ) -> Result<Connecting, ConnectError> {
+        self.connect_from(config, FourTuple::new(addr, None), server_name)
+    }
+
+    /// Connect over `network_path` using a custom configuration, sending from its local IP if
+    /// it has one, as [`Connection::open_path`] does for later paths.
+    ///
+    /// See [`connect()`] for details.
+    ///
+    /// [`connect()`]: Endpoint::connect
+    pub fn connect_from(
+        &self,
+        config: ClientConfig,
+        network_path: FourTuple,
+        server_name: &str,
+    ) -> Result<Connecting, ConnectError> {
+        let addr = network_path.remote();
         let mut endpoint = self.inner.state.lock().unwrap();
         if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
             return Err(ConnectError::EndpointStopping);
@@ -251,9 +267,12 @@ impl Endpoint {
             addr
         };
 
-        let (ch, conn) = endpoint
-            .inner
-            .connect(self.runtime.now(), config, addr, server_name)?;
+        let (ch, conn) = endpoint.inner.connect_from(
+            self.runtime.now(),
+            config,
+            FourTuple::new(addr, network_path.local_ip()),
+            server_name,
+        )?;
 
         let sender = endpoint.socket.create_sender();
         endpoint.stats.outgoing_handshakes += 1;
