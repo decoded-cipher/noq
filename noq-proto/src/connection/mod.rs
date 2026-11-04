@@ -263,6 +263,8 @@ pub struct Connection {
     local_cid_state: FxHashMap<PathId, CidState>,
     /// State of the unreliable datagram extension
     datagrams: DatagramState,
+    /// Whether stream data goes before datagrams in the next packet that has both waiting
+    streams_first: bool,
     /// Path level statistics.
     path_stats: PathStatsMap,
     /// Accumulated stats of all discarded paths.
@@ -441,6 +443,7 @@ impl Connection {
                 config.stream_receive_window,
             ),
             datagrams: DatagramState::default(),
+            streams_first: false,
             config,
             remote_cids: FxHashMap::from_iter([(PathId::ZERO, CidQueue::new(remote_cid))]),
             rng,
@@ -6744,6 +6747,26 @@ impl Connection {
             builder.write_frame(frame, stats);
         }
 
+        // DATAGRAM and STREAM frames take turns going first while both have data waiting,
+        // so a flood of either cannot starve the other
+        let streams_waiting = space_id == SpaceId::Data
+            && scheduling_info.can_send_data
+            && (self.streams.can_send_sticky_stream_data(path_id)
+                || (scheduling_info.unpinned_data && self.streams.can_send_any_stream_data()));
+        let contended = streams_waiting && self.datagrams.has_outgoing(path_id);
+        let streams_first = contended && self.streams_first;
+        if contended {
+            self.streams_first = !self.streams_first;
+        }
+        if streams_first {
+            self.streams.write_stream_frames(
+                builder,
+                stats,
+                path_id,
+                scheduling_info.unpinned_data,
+            );
+        }
+
         // DATAGRAM
         let mut sent_datagrams = false;
         while !scheduling_info.is_abandoned
@@ -6809,7 +6832,7 @@ impl Connection {
         }
 
         // STREAM
-        if scheduling_info.can_send_data && space_id == SpaceId::Data {
+        if !streams_first && scheduling_info.can_send_data && space_id == SpaceId::Data {
             self.streams.write_stream_frames(
                 builder,
                 stats,

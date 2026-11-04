@@ -2510,6 +2510,37 @@ fn datagram_send_recv() {
 }
 
 #[test]
+fn datagrams_and_stream_data_take_turns() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+    let max = pair.client_datagrams(client_ch).max_size().unwrap();
+    for _ in 0..8 {
+        pair.client_datagrams(client_ch)
+            .send(vec![0; max].into(), true)
+            .unwrap();
+    }
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, stream)
+        .write(&[0; 8000])
+        .unwrap();
+
+    let before = pair.client_conn_mut(client_ch).stats().frame_tx;
+    let now = pair.time;
+    let mut buf = Vec::new();
+    for _ in 0..4 {
+        buf.clear();
+        pair.client_conn_mut(client_ch)
+            .poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+            .unwrap();
+    }
+    let after = pair.client_conn_mut(client_ch).stats().frame_tx;
+    // Every datagram fills a packet, so without turns all four would carry one.
+    assert_eq!(after.datagram - before.datagram, 2);
+    assert!(after.stream > before.stream);
+}
+
+#[test]
 fn datagram_batch_send_recv_many() {
     let _guard = subscribe();
     let mut pair = Pair::default();
