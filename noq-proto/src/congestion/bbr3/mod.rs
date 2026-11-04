@@ -174,6 +174,8 @@ enum BbrState {
 /// equivalent to BBR.ack_phase states <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6>
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum AckPhase {
+    /// equivalent to ACKS_INIT: not tracking a bandwidth probe's samples
+    Init,
     /// equivalent to ACKS_PROBE_STARTING
     ProbeStarting,
     /// equivalent to ACKS_PROBE_STOPPING
@@ -996,13 +998,19 @@ impl Bbr3 {
         if self.ack_phase == AckPhase::ProbeStarting && self.round_start {
             self.ack_phase = AckPhase::ProbeFeedback;
         }
-        if self.ack_phase == AckPhase::ProbeStopping
-            && self.round_start
-            && let BbrState::ProbeBw(_) = self.state
-            && let Some(rate_sample) = self.rs
-            && !rate_sample.is_app_limited
-        {
-            self.advance_max_bw_filter();
+        // The probe's samples have all come back after one round: the filter advances once per
+        // cycle, and later losses are no longer the probe's. The draft leaves ack_phase in
+        // ProbeStopping, which advanced the filter every round through cruise, so `max_bw`
+        // followed the flow's own pacing down; Linux and xquic reset it here.
+        if self.ack_phase == AckPhase::ProbeStopping && self.round_start {
+            self.ack_phase = AckPhase::Init;
+            self.bw_probe_samples = false;
+            if let BbrState::ProbeBw(_) = self.state
+                && let Some(rate_sample) = self.rs
+                && !rate_sample.is_app_limited
+            {
+                self.advance_max_bw_filter();
+            }
         }
         if !self.is_inflight_too_high() {
             if self.inflight_longterm == u64::MAX {
@@ -5367,6 +5375,98 @@ mod test {
             bbr.max_bw >= 0.85 * BW_LO,
             "max_bw should track the new path delivery rate BW_LO, got {}",
             bbr.max_bw
+        );
+    }
+
+    /// Over a clean link `max_bw` holds the bottleneck rate through each cruise, and the max-bw
+    /// filter advances once per PROBE_BW cycle rather than every round. Advancing it every round
+    /// let `max_bw` follow the flow's own pacing (1% under it) down by a few percent a second.
+    #[test]
+    fn max_bw_holds_through_cruise() {
+        const MSS: u64 = 1200;
+        const RTT_NS: u64 = 20_000_000;
+        const BW: f64 = 12_500_000.0;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        const RUN_NS: u64 = 30_000_000_000;
+
+        let seed: [u8; 16] = [7; 16];
+        let config = Bbr3Config {
+            probe_rng_seed: Some(seed),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+        let service_ns = (MSS as f64 / BW * 1e9).round() as u64;
+
+        let mut flight: VecDeque<(u64, u64, u64)> = VecDeque::new();
+        let (mut now_ns, mut next_send_ns, mut btl_free_ns) = (0u64, 0u64, 0u64);
+        let (mut inflight, mut pn) = (0u64, 0u64);
+        let mut lowest_cruise_bw = f64::INFINITY;
+        let (mut stopping_phases, mut advances) = (0u64, 0u64);
+        let mut stopping = false;
+
+        while now_ns < RUN_NS {
+            let can_send = inflight + MSS <= bbr.window();
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_ack = flight.front().map(|&(_, _, ack_ns)| ack_ns);
+            if can_send && next_ack.is_none_or(|ack| next_send_ns <= ack) {
+                let send_ns = now_ns.max(next_send_ns);
+                now_ns = send_ns;
+                let finish = (send_ns + FWD_NS).max(btl_free_ns) + service_ns;
+                btl_free_ns = finish;
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn, SpaceKind::Data);
+                inflight += MSS;
+                flight.push_back((pn, send_ns, finish + RET_NS));
+                next_send_ns = send_ns + (MSS as f64 / bbr.pacing_rate.max(1.0) * 1e9) as u64;
+                pn += 1;
+                continue;
+            }
+            let (acked, send_ns, ack_ns) = flight.pop_front().expect("data in flight");
+            now_ns = now_ns.max(ack_ns);
+            inflight -= MSS;
+            rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - send_ns));
+            let cycle_before = bbr.cycle_count;
+            bbr.on_ack(
+                at(now_ns),
+                at(send_ns),
+                MSS,
+                acked,
+                SpaceKind::Data,
+                false,
+                &rtt_est,
+            );
+            bbr.on_end_acks(at(now_ns), inflight, false, Some(acked), SpaceKind::Data);
+
+            advances += bbr.cycle_count - cycle_before;
+            let now_stopping = bbr.ack_phase == AckPhase::ProbeStopping;
+            if now_stopping && !stopping {
+                stopping_phases += 1;
+            }
+            stopping = now_stopping;
+            if bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Cruise) && now_ns > RUN_NS / 3 {
+                assert!(
+                    !bbr.bw_probe_samples,
+                    "losses in cruise are not the probe's"
+                );
+                lowest_cruise_bw = lowest_cruise_bw.min(bbr.max_bw);
+            }
+        }
+
+        assert!(lowest_cruise_bw.is_finite(), "the flow never cruised");
+        assert!(
+            lowest_cruise_bw >= 0.97 * BW,
+            "max_bw fell to {:.1}% of the bottleneck in cruise",
+            100.0 * lowest_cruise_bw / BW
+        );
+        assert!(advances >= 3, "too few PROBE_BW cycles: {advances}");
+        assert!(
+            advances <= stopping_phases,
+            "the max-bw filter advanced {advances} times in {stopping_phases} cycles"
         );
     }
 
