@@ -27,7 +27,7 @@ impl Datagrams<'_> {
     ///
     /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
     pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
-        self.queue(None, data, drop)
+        self.queue(None, data, drop, false)
     }
 
     /// Queue an unreliable, unordered datagram to be sent on `path` only, whatever its status
@@ -40,10 +40,33 @@ impl Datagrams<'_> {
         data: Bytes,
         drop: bool,
     ) -> Result<(), SendDatagramError> {
+        self.queue_on_path(path, data, drop, false)
+    }
+
+    /// Queue an unreliable, unordered datagram to be sent on `path` only, ahead of its
+    /// datagrams queued with [`Self::send_on_path`] and of stream data
+    ///
+    /// For light traffic that must not wait behind bulk, such as calls, games or DNS. It shares
+    /// the path's send buffer, which drops other datagrams first to make room.
+    pub fn send_urgent_on_path(
+        &mut self,
+        path: PathId,
+        data: Bytes,
+    ) -> Result<(), SendDatagramError> {
+        self.queue_on_path(path, data, true, true)
+    }
+
+    fn queue_on_path(
+        &mut self,
+        path: PathId,
+        data: Bytes,
+        drop: bool,
+        urgent: bool,
+    ) -> Result<(), SendDatagramError> {
         if !self.conn.paths.contains_key(&path) || self.conn.abandoned_paths.contains(&path) {
             return Err(SendDatagramError::PathClosed);
         }
-        self.queue(Some(path), data, drop)
+        self.queue(Some(path), data, drop, urgent)
     }
 
     fn queue(
@@ -51,6 +74,7 @@ impl Datagrams<'_> {
         path: Option<PathId>,
         data: Bytes,
         drop: bool,
+        urgent: bool,
     ) -> Result<(), SendDatagramError> {
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
@@ -73,7 +97,10 @@ impl Datagrams<'_> {
             datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        buffer.push_back(Datagram { data });
+        match urgent {
+            true => buffer.push_urgent(Datagram { data }),
+            false => buffer.push_back(Datagram { data }),
+        }
         Ok(())
     }
 
@@ -270,6 +297,13 @@ impl DatagramState {
         unpinned && self.outgoing.write(buf, stat)
     }
 
+    /// Whether `path` has urgent datagrams waiting, which go before stream data
+    pub(super) fn has_urgent(&self, path: PathId) -> bool {
+        self.outgoing_on_path
+            .get(&path)
+            .is_some_and(|buffer| !buffer.urgent.is_empty())
+    }
+
     pub(super) fn can_send_on_path(&self, path: PathId, max_size: usize) -> bool {
         self.outgoing_on_path
             .get(&path)
@@ -310,6 +344,8 @@ impl DatagramState {
 
 #[derive(Default)]
 pub(super) struct DatagramBuffer {
+    /// Sent before `queue`
+    urgent: VecDeque<Datagram>,
     queue: VecDeque<Datagram>,
     payload_bytes: usize,
 }
@@ -320,15 +356,28 @@ impl DatagramBuffer {
         self.queue.push_back(datagram);
     }
 
+    fn push_urgent(&mut self, datagram: Datagram) {
+        self.payload_bytes += datagram.data.len();
+        self.urgent.push_back(datagram);
+    }
+
+    /// Removes the next datagram to send
     fn pop_front(&mut self) -> Option<Datagram> {
-        let datagram = self.queue.pop_front()?;
+        let datagram = self.next_queue().pop_front()?;
         self.payload_bytes -= datagram.data.len();
         Some(datagram)
     }
 
-    fn push_front(&mut self, datagram: Datagram) {
-        self.payload_bytes += datagram.data.len();
-        self.queue.push_front(datagram);
+    /// The queue the next datagram is sent from
+    fn next_queue(&mut self) -> &mut VecDeque<Datagram> {
+        match self.urgent.is_empty() {
+            true => &mut self.queue,
+            false => &mut self.urgent,
+        }
+    }
+
+    fn front(&self) -> Option<&Datagram> {
+        self.urgent.front().or_else(|| self.queue.front())
     }
 
     /// Payload bytes queued and not yet sent
@@ -338,14 +387,16 @@ impl DatagramBuffer {
 
     fn memory_used(&self) -> usize {
         self.payload_bytes
-            .saturating_add(self.queue.len() * size_of::<Datagram>())
+            .saturating_add(self.len() * size_of::<Datagram>())
     }
 
+    /// Drops the oldest datagrams, urgent ones last, until `datagram_len` more bytes fit
     fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
         while !self.has_send_buffer_space(datagram_len, send_buffer_size) {
-            let Some(prev) = self.pop_front() else {
+            let Some(prev) = self.queue.pop_front().or_else(|| self.urgent.pop_front()) else {
                 break;
             };
+            self.payload_bytes -= prev.data.len();
             trace!(len = prev.data.len(), "dropping outgoing datagram");
         }
     }
@@ -360,19 +411,22 @@ impl DatagramBuffer {
 
     fn drop_oversized(&mut self, max_payload: usize) -> bool {
         let mut dropped_any = false;
-        self.queue.retain(|datagram| {
-            let result = datagram.data.len() < max_payload;
-            if !result {
-                trace!(
-                    "dropping {} byte datagram violating {} byte limit",
-                    datagram.data.len(),
-                    max_payload
-                );
-                self.payload_bytes -= datagram.data.len();
-                dropped_any = true;
-            }
-            result
-        });
+        let payload_bytes = &mut self.payload_bytes;
+        for queue in [&mut self.urgent, &mut self.queue] {
+            queue.retain(|datagram| {
+                let result = datagram.data.len() < max_payload;
+                if !result {
+                    trace!(
+                        "dropping {} byte datagram violating {} byte limit",
+                        datagram.data.len(),
+                        max_payload
+                    );
+                    *payload_bytes -= datagram.data.len();
+                    dropped_any = true;
+                }
+                result
+            });
+        }
         dropped_any
     }
 
@@ -380,31 +434,31 @@ impl DatagramBuffer {
     ///
     /// Returns whether a frame was written.
     fn write<'a, 'b>(&mut self, buf: &mut PacketBuilder<'a, 'b>, stat: &mut FrameStats) -> bool {
+        // Future work: we could be more clever about cramming small datagrams into
+        // mostly-full packets when a larger one is queued first
+        if self
+            .front()
+            .is_none_or(|datagram| buf.frame_space_remaining() < datagram.size(true))
+        {
+            return false;
+        }
         let Some(datagram) = self.pop_front() else {
             return false;
         };
-
-        if buf.frame_space_remaining() < datagram.size(true) {
-            // Future work: we could be more clever about cramming small datagrams into
-            // mostly-full packets when a larger one is queued first
-            self.push_front(datagram);
-            return false;
-        }
-
         buf.write_frame(datagram, stat);
         true
     }
 
     pub(super) fn can_send_1rtt(&self, max_size: usize) -> bool {
-        self.queue.front().is_some_and(|x| x.size(true) <= max_size)
+        self.front().is_some_and(|x| x.size(true) <= max_size)
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.urgent.is_empty() && self.queue.is_empty()
     }
 
     fn len(&self) -> usize {
-        self.queue.len()
+        self.urgent.len() + self.queue.len()
     }
 
     /// Removes and returns the first `n` datagrams, in arrival order.
@@ -437,6 +491,29 @@ mod tests {
         assert_eq!(state.outgoing.queue.len(), 1);
         assert_eq!(state.outgoing.queue[0].data.len(), 2);
         assert_eq!(state.outgoing.payload_bytes, 2);
+    }
+
+    fn datagram(len: usize) -> Datagram {
+        Datagram {
+            data: Bytes::from(alloc::vec![0; len]),
+        }
+    }
+
+    #[test]
+    fn urgent_datagrams_go_first_and_are_dropped_last() {
+        let mut buffer = DatagramBuffer::default();
+        buffer.push_back(datagram(1));
+        buffer.push_back(datagram(2));
+        buffer.push_urgent(datagram(3));
+        assert_eq!(buffer.payload_bytes(), 6);
+        assert_eq!(buffer.front().map(|d| d.data.len()), Some(3));
+
+        // Room for one more 3-byte datagram costs both bulk ones, not the urgent one.
+        buffer.make_space_for(3, 6 + 2 * size_of::<Datagram>());
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.pop_front().map(|d| d.data.len()), Some(3));
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.payload_bytes(), 0);
     }
 
     #[test]

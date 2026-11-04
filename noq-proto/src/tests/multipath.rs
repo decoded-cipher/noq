@@ -2957,6 +2957,25 @@ fn datagrams_bound_to_a_path_are_sent_on_it() -> TestResult {
 }
 
 #[test]
+fn urgent_datagrams_overtake_those_queued_before_them() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = pair_with_two_paths()?;
+    let second = PathId(1);
+    for message in [&b"bulk 1"[..], b"bulk 2"] {
+        pair.datagrams(Client)
+            .send_on_path(second, Bytes::from_static(message), false)?;
+    }
+    pair.datagrams(Client)
+        .send_urgent_on_path(second, Bytes::from_static(b"urgent"))?;
+    assert_eq!(pair.datagrams(Client).queued_on_path(second), 18);
+    pair.drive();
+
+    let received: Vec<Bytes> = core::iter::from_fn(|| pair.datagrams(Server).recv()).collect();
+    assert_eq!(received, [&b"urgent"[..], b"bulk 1", b"bulk 2"]);
+    Ok(())
+}
+
+#[test]
 fn each_path_has_its_own_datagram_send_buffer() -> TestResult {
     let _guard = subscribe();
     let mut transport = TransportConfig::default();

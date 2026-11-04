@@ -717,12 +717,40 @@ impl Connection {
         path: PathId,
         data: Bytes,
     ) -> Result<(), SendDatagramError> {
+        self.send_datagram_on_path_with(path, data, false)
+    }
+
+    /// Transmit an unreliable, unordered application datagram on `path` only, ahead of the
+    /// datagrams queued with [`send_datagram_on_path()`](Self::send_datagram_on_path) and of
+    /// stream data
+    ///
+    /// For light traffic that must not wait behind bulk, such as calls, games or DNS. It shares
+    /// the path's send buffer, which drops other datagrams first to make room.
+    pub fn send_urgent_datagram_on_path(
+        &self,
+        path: PathId,
+        data: Bytes,
+    ) -> Result<(), SendDatagramError> {
+        self.send_datagram_on_path_with(path, data, true)
+    }
+
+    fn send_datagram_on_path_with(
+        &self,
+        path: PathId,
+        data: Bytes,
+        urgent: bool,
+    ) -> Result<(), SendDatagramError> {
         let conn = &mut *self.0.lock_and_wake("send_datagram_on_path");
         if let Some(ref x) = conn.error {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
         }
         use proto::SendDatagramError::*;
-        match conn.inner.datagrams().send_on_path(path, data, true) {
+        let mut datagrams = conn.inner.datagrams();
+        let sent = match urgent {
+            true => datagrams.send_urgent_on_path(path, data),
+            false => datagrams.send_on_path(path, data, true),
+        };
+        match sent {
             Ok(()) => Ok(()),
             Err(e) => Err(match e {
                 Blocked(..) => unreachable!(),

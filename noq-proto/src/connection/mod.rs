@@ -6755,15 +6755,16 @@ impl Connection {
         }
 
         // DATAGRAM and STREAM frames take turns going first while both have data waiting,
-        // so a flood of either cannot starve the other
+        // so a flood of either cannot starve the other; urgent datagrams always go first
         let streams_waiting = space_id == SpaceId::Data
             && scheduling_info.can_send_data
             && (self.streams.can_send_sticky_stream_data(path_id)
                 || (scheduling_info.unpinned_data && self.streams.can_send_any_stream_data()));
         let contended = streams_waiting && self.datagrams.has_outgoing(path_id);
-        let streams_first = contended && self.streams_first;
+        let streams_first =
+            contended && self.streams_first && !self.datagrams.has_urgent(path_id);
         if contended {
-            self.streams_first = !self.streams_first;
+            self.streams_first = !streams_first;
         }
         if streams_first {
             self.streams.write_stream_frames(
