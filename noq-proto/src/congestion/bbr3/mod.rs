@@ -296,6 +296,10 @@ pub struct Bbr3 {
     /// point in the last packet-timed round trip. Transport-provided (via `on_cwnd_limited`);
     /// snapshotted from `cwnd_limited_this_round` at each round boundary.
     is_cwnd_limited: bool,
+    /// Whether `inflight_longterm` held the window at the last window update. Probing raises
+    /// `inflight_longterm` a few bytes per ACK before the window follows, so comparing the two
+    /// mid-ACK would almost never find the window at the bound.
+    cwnd_at_longterm: bool,
     /// ORs every cwnd-blocked send in the current round; snapshotted into `is_cwnd_limited` and
     /// cleared when the round advances.
     cwnd_limited_this_round: bool,
@@ -615,6 +619,7 @@ impl Bbr3 {
             delivered: 0,
             inflight: 0,
             is_cwnd_limited: false,
+            cwnd_at_longterm: false,
             cwnd_limited_this_round: false,
             cycle_count: 0,
             cwnd: initial_cwnd,
@@ -1086,7 +1091,7 @@ impl Bbr3 {
 
     /// equivalent to BBRIsTimeToGoDown <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-6>
     fn maybe_go_down(&mut self) -> bool {
-        if self.is_cwnd_limited && self.cwnd >= self.inflight_longterm {
+        if self.is_cwnd_limited && (self.cwnd >= self.inflight_longterm || self.cwnd_at_longterm) {
             self.reset_full_bw();
             if let Some(rate_sample) = self.rs {
                 self.full_bw = rate_sample.delivery_rate;
@@ -1421,6 +1426,7 @@ impl Bbr3 {
         }
         cap = Ord::min(cap, self.inflight_shortterm);
         cap = Ord::max(cap, self.min_pipe_cwnd);
+        self.cwnd_at_longterm = self.cwnd >= self.inflight_longterm;
         self.cwnd = Ord::min(self.cwnd, cap);
     }
 
