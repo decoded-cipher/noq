@@ -342,6 +342,12 @@ impl SendBuffer {
         self.data.len() == 0
     }
 
+    /// Bytes waiting to be sent: never sent, or marked for retransmission
+    pub(super) fn unsent_bytes(&self) -> u64 {
+        let retransmits: u64 = self.retransmits.iter().map(|r| r.end - r.start).sum();
+        (self.offset() - self.unsent).saturating_add(retransmits)
+    }
+
     /// Whether there's data to send
     ///
     /// There may be sent unacknowledged data even when this is false.

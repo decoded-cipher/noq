@@ -31,6 +31,9 @@ pub struct PathSnapshot {
     pub bytes_in_flight: u64,
     /// Current maximum UDP payload size on the path
     pub mtu: u16,
+    /// What the congestion controller estimates the path delivers, in bits per second, if it
+    /// makes an estimate
+    pub bandwidth: Option<u64>,
 }
 
 /// A [`PathScheduler`]'s decision for one path
@@ -51,7 +54,16 @@ pub trait PathScheduler: Send + Sync + fmt::Debug {
     ///
     /// Paths left out are tried last and carry only pinned data. Choices for unknown paths
     /// are ignored.
-    fn schedule(&mut self, now: Instant, paths: &[PathSnapshot], choices: &mut Vec<PathChoice>);
+    ///
+    /// `backlog` is what the connection has waiting to be sent that no path is bound to, in
+    /// bytes: stream data, retransmissions included, and datagrams not pinned to a path.
+    fn schedule(
+        &mut self,
+        now: Instant,
+        backlog: u64,
+        paths: &[PathSnapshot],
+        choices: &mut Vec<PathChoice>,
+    );
 }
 
 /// Builds a [`PathScheduler`] for each new connection

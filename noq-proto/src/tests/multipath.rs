@@ -2616,7 +2616,13 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 struct FixedPathScheduler(Vec<PathChoice>);
 
 impl PathScheduler for FixedPathScheduler {
-    fn schedule(&mut self, _now: Instant, _paths: &[PathSnapshot], choices: &mut Vec<PathChoice>) {
+    fn schedule(
+        &mut self,
+        _now: Instant,
+        _backlog: u64,
+        _paths: &[PathSnapshot],
+        choices: &mut Vec<PathChoice>,
+    ) {
         choices.extend_from_slice(&self.0);
     }
 }

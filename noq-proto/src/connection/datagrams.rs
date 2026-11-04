@@ -331,6 +331,11 @@ impl DatagramBuffer {
         self.queue.push_front(datagram);
     }
 
+    /// Payload bytes queued and not yet sent
+    pub(super) fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
     fn memory_used(&self) -> usize {
         self.payload_bytes
             .saturating_add(self.queue.len() * size_of::<Datagram>())

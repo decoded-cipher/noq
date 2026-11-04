@@ -803,6 +803,15 @@ impl StreamsState {
     /// Queues MAX_STREAM_ID frames in `pending` if needed
     ///
     /// Returns whether any frames were queued.
+    /// Stream bytes waiting to be sent, over every stream
+    pub(crate) fn unsent_bytes(&self) -> u64 {
+        self.send
+            .values()
+            .filter_map(|stream| stream.as_ref())
+            .map(|stream| stream.pending.unsent_bytes())
+            .sum()
+    }
+
     pub(crate) fn queue_max_stream_id(&mut self, pending: &mut Retransmits) -> bool {
         let mut queued = false;
         for dir in Dir::iter() {

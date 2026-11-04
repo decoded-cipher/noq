@@ -1254,11 +1254,16 @@ impl Connection {
                 congestion_window: data.congestion.window(),
                 bytes_in_flight: data.in_flight.bytes,
                 mtu: data.current_mtu(),
+                bandwidth: data.congestion.metrics().bandwidth_estimate,
             });
         }
+        let backlog = self
+            .streams
+            .unsent_bytes()
+            .saturating_add(self.datagrams.outgoing.payload_bytes() as u64);
         let mut choices = mem::take(&mut self.path_choices);
         if let Some(scheduler) = &mut self.path_scheduler {
-            scheduler.schedule(now, &snapshots, &mut choices);
+            scheduler.schedule(now, backlog, &snapshots, &mut choices);
         }
 
         for choice in &choices {
