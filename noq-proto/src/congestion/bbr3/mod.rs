@@ -84,6 +84,10 @@ const PROBE_RTT_INTERVAL_SEC: u64 = 5;
 /// loss rate when probing for bandwidth (the default is 2%).
 const LOSS_THRESH: f64 = 0.02;
 
+/// The least queueing ever taken for a queue rather than jitter, by
+/// [`Bbr3Config::random_loss_tolerant`] and [`Bbr3Config::queue_sensitive`].
+const QUEUE_FLOOR: Duration = Duration::from_millis(20);
+
 /// equivalent to BBR.Beta: A constant specifying the default multiplicative decrease to make upon
 /// each round trip during which the connection detects packet loss (the value is 0.7).
 const BETA: f64 = 0.7;
@@ -300,6 +304,10 @@ pub struct Bbr3 {
     is_cwnd_limited: bool,
     /// See [`Bbr3Config::random_loss_tolerant`].
     random_loss_tolerant: bool,
+    /// See [`Bbr3Config::queue_sensitive`].
+    queue_sensitive: bool,
+    /// Whether a queue stood out during the round: a congestion signal, as a loss is.
+    queue_in_round: bool,
     /// The path's smoothed RTT and its variation, as of the last ACK.
     smoothed_rtt: Duration,
     rtt_variation: Duration,
@@ -627,6 +635,8 @@ impl Bbr3 {
             inflight: 0,
             is_cwnd_limited: false,
             random_loss_tolerant: config.random_loss_tolerant,
+            queue_sensitive: config.queue_sensitive,
+            queue_in_round: false,
             smoothed_rtt: Duration::ZERO,
             rtt_variation: Duration::ZERO,
             cwnd_at_longterm: false,
@@ -759,6 +769,7 @@ impl Bbr3 {
         }
         self.adapt_lower_bounds_from_congestion();
         self.loss_in_round = false;
+        self.queue_in_round = false;
     }
 
     /// equivalent to BBRUpdateMaxBw <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.5>
@@ -798,7 +809,7 @@ impl Bbr3 {
             | BbrState::ProbeBw(ProbeBwSubstate::Up)
             | BbrState::Startup => {}
             _ => {
-                if self.loss_in_round {
+                if self.loss_in_round || self.queue_in_round {
                     self.init_lower_bounds();
                     self.loss_lower_bounds();
                 }
@@ -1441,6 +1452,15 @@ impl Bbr3 {
             _ => {}
         }
         cap = Ord::min(cap, self.inflight_shortterm);
+        // While a queue stands out, hold no more than the path carries in its minimum RTT and the
+        // jitter allowance, so the queue drains to that allowance instead of staying in the window.
+        if self.queue_sensitive && self.queueing_stands_out() == Some(true) && self.bw_latest > 0.0
+        {
+            let delivering = self.bw.min(self.bw_latest);
+            let drained =
+                (delivering * (self.min_rtt + self.queue_allowance()).as_secs_f64()) as u64;
+            cap = Ord::min(cap, drained);
+        }
         cap = Ord::max(cap, self.min_pipe_cwnd);
         self.cwnd_at_longterm = self.cwnd >= self.inflight_longterm;
         self.cwnd = Ord::min(self.cwnd, cap);
@@ -1530,14 +1550,24 @@ impl Bbr3 {
 
     /// Whether a loss now is taken for random loss: see [`Bbr3Config::random_loss_tolerant`].
     fn loss_is_random(&self) -> bool {
-        if !self.random_loss_tolerant
-            || self.min_rtt == Duration::from_secs(u64::MAX)
-            || self.smoothed_rtt.is_zero()
-        {
-            return false;
+        self.random_loss_tolerant && self.queueing_stands_out() == Some(false)
+    }
+
+    /// Whether the smoothed RTT shows a queue beyond the path's jitter: more than
+    /// [`Self::queue_allowance`] above the minimum RTT. `None` until both are known.
+    fn queueing_stands_out(&self) -> Option<bool> {
+        if self.min_rtt == Duration::from_secs(u64::MAX) || self.smoothed_rtt.is_zero() {
+            return None;
         }
         let queueing = self.smoothed_rtt.saturating_sub(self.min_rtt);
-        queueing < self.min_rtt / 2 + 2 * self.rtt_variation
+        Some(queueing >= self.queue_allowance())
+    }
+
+    /// Queueing taken for jitter rather than a queue: half the minimum RTT, at least
+    /// [`QUEUE_FLOOR`], plus twice the RTT variation. A short path's minimum RTT sits well below
+    /// its typical one, so without the floor its jitter alone would read as a queue.
+    fn queue_allowance(&self) -> Duration {
+        Ord::max(self.min_rtt / 2, QUEUE_FLOOR) + 2 * self.rtt_variation
     }
 
     /// equivalent to BBRNoteLoss <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-11>
@@ -1702,6 +1732,9 @@ impl Bbr3 {
     ) {
         self.smoothed_rtt = rtt.get();
         self.rtt_variation = rtt.var();
+        if self.queue_sensitive && self.queueing_stands_out() == Some(true) {
+            self.queue_in_round = true;
+        }
         self.check_recovery_done(sent);
         self.delivered += bytes;
         self.delivered_time = Some(now);
@@ -2051,11 +2084,23 @@ pub struct Bbr3Config {
     pacing_margin_percent: Option<f64>,
     default_cwnd_gain: Option<f64>,
     random_loss_tolerant: bool,
+    queue_sensitive: bool,
 }
 
 impl Bbr3Config {
+    /// Takes a queue beyond the path's usual jitter, by the same measure as
+    /// [`Self::random_loss_tolerant`], for congestion, as a loss is: the short-term bounds fall
+    /// toward what the path now delivers. Where a deep buffer meets a rate that drops, as on a
+    /// mobile link, BBR otherwise keeps sending at the rate it measured before the drop until
+    /// its max-bw filter forgets it, and the queue grows to the whole window. Off by default.
+    pub fn queue_sensitive(&mut self, enabled: bool) -> &mut Self {
+        self.queue_sensitive = enabled;
+        self
+    }
+
     /// Takes a loss for congestion only while the smoothed RTT shows a queue beyond the path's
-    /// usual jitter: more than half the minimum RTT plus twice the RTT variation above it.
+    /// usual jitter: more than half the minimum RTT, at least 20 ms, plus twice the RTT
+    /// variation above it.
     /// Other losses, such as a radio link's, are still retransmitted but leave the rate model
     /// alone; without this, random loss above 2 % of a small window holds BBR far below the
     /// path's rate. Off by default.
@@ -2090,6 +2135,7 @@ impl Default for Bbr3Config {
             pacing_margin_percent: None,
             default_cwnd_gain: None,
             random_loss_tolerant: false,
+            queue_sensitive: false,
         }
     }
 }
@@ -2274,6 +2320,7 @@ mod test {
             pacing_margin_percent: None,
             default_cwnd_gain: None,
             random_loss_tolerant: false,
+            queue_sensitive: false,
         };
         let mut bbr3 = Bbr3::new(Arc::new(config), 2500);
         bbr3.pick_probe_wait();
@@ -5509,29 +5556,40 @@ mod test {
         );
     }
 
-    /// Runs an always-backlogged, paced sender for 20 s over one 100 Mbit/s bottleneck with a
-    /// 20 ms RTT and a FIFO of `buffer_bytes`, also dropping the packets `drop` picks. Returns
-    /// the controller, the bytes delivered in the second half, and the bytes sent and lost.
-    fn run_lossy_link(
+    /// What [`run_link`] measured.
+    struct LinkRun {
+        bbr: Bbr3,
+        /// Bytes delivered in the second half of the run.
+        late_delivered: u64,
+        sent: u64,
+        lost: u64,
+        /// When each acknowledgement arrived and the RTT it measured, in nanoseconds.
+        acks: Vec<(u64, u64)>,
+    }
+
+    /// Runs an always-backlogged, paced sender for 20 s over one bottleneck with a 20 ms RTT,
+    /// whose rate in bytes per second `rate` gives for each instant, and a FIFO of
+    /// `buffer_bytes`, also dropping the packets `drop` picks.
+    fn run_link(
         config: Bbr3Config,
         buffer_bytes: f64,
         drop: impl Fn(u64) -> bool,
-    ) -> (Bbr3, u64, u64, u64) {
+        rate: impl Fn(u64) -> f64,
+    ) -> LinkRun {
         const MSS: u64 = 1200;
         const RTT_NS: u64 = 20_000_000;
-        const BW: f64 = 12_500_000.0;
         const RUN_NS: u64 = 20_000_000_000;
 
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
         let base = Instant::now();
         let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
         let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
-        let service_ns = (MSS as f64 / BW * 1e9).round() as u64;
 
         let mut flight: VecDeque<(u64, u64, u64, bool)> = VecDeque::new();
         let (mut now_ns, mut next_send_ns, mut btl_free_ns) = (0u64, 0u64, 0u64);
         let (mut inflight, mut pn) = (0u64, 0u64);
         let (mut late_delivered, mut sent, mut lost) = (0u64, 0u64, 0u64);
+        let mut acks = Vec::new();
         while now_ns < RUN_NS {
             let can_send = inflight + MSS <= bbr.window();
             if !can_send {
@@ -5542,12 +5600,13 @@ mod test {
                 let send_ns = now_ns.max(next_send_ns);
                 now_ns = send_ns;
                 let arrival = send_ns + RTT_NS / 2;
-                let queued = btl_free_ns.saturating_sub(arrival) as f64 / service_ns as f64;
-                let overflow = queued * MSS as f64 > buffer_bytes;
+                let bytes_per_ns = rate(arrival) / 1e9;
+                let queued = btl_free_ns.saturating_sub(arrival) as f64 * bytes_per_ns;
+                let overflow = queued > buffer_bytes;
                 let event_ns = if overflow {
                     arrival.max(btl_free_ns) + RTT_NS / 2
                 } else {
-                    btl_free_ns = arrival.max(btl_free_ns) + service_ns;
+                    btl_free_ns = arrival.max(btl_free_ns) + (MSS as f64 / bytes_per_ns) as u64;
                     btl_free_ns + RTT_NS / 2
                 };
                 bbr.on_packet_sent(at(send_ns), MSS as u16, pn, SpaceKind::Data);
@@ -5567,6 +5626,7 @@ mod test {
                 continue;
             }
             rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - send_ns));
+            acks.push((now_ns, now_ns - send_ns));
             bbr.on_ack(
                 at(now_ns),
                 at(send_ns),
@@ -5581,7 +5641,60 @@ mod test {
                 late_delivered += MSS;
             }
         }
-        (bbr, late_delivered, sent, lost)
+        LinkRun {
+            bbr,
+            late_delivered,
+            sent,
+            lost,
+            acks,
+        }
+    }
+
+    /// [`run_link`] over a steady 100 Mbit/s: the controller, the bytes delivered in the second
+    /// half, and the bytes sent and lost.
+    fn run_lossy_link(
+        config: Bbr3Config,
+        buffer_bytes: f64,
+        drop: impl Fn(u64) -> bool,
+    ) -> (Bbr3, u64, u64, u64) {
+        let run = run_link(config, buffer_bytes, drop, |_| 12_500_000.0);
+        (run.bbr, run.late_delivered, run.sent, run.lost)
+    }
+
+    /// When the rate under a deep buffer drops to 30 % for 6 s, a queue-sensitive BBR keeps the
+    /// queue near its jitter allowance instead of letting it grow to the window, and still
+    /// delivers close to the lower rate.
+    #[test]
+    fn queue_sensitivity_drains_the_queue_when_the_rate_drops() {
+        const BW: f64 = 12_500_000.0;
+        let fade = 6_000_000_000..12_000_000_000;
+        let rate = |ns: u64| if fade.contains(&ns) { BW * 0.3 } else { BW };
+        let mut config = Bbr3Config {
+            probe_rng_seed: Some([9; 16]),
+            ..Bbr3Config::default()
+        };
+        config.queue_sensitive(true);
+        let run = run_link(config, BW * 0.02 * 4.0, |_| false, rate);
+        let late_fade = 8_000_000_000..12_000_000_000;
+        let mut rtts: Vec<u64> = run
+            .acks
+            .iter()
+            .filter(|(at, _)| late_fade.contains(at))
+            .map(|&(_, rtt)| rtt)
+            .collect();
+        rtts.sort_unstable();
+        let p90 = rtts[rtts.len() * 9 / 10];
+        assert!(
+            p90 < 45_000_000,
+            "P90 RTT {:.1} ms while the rate was down",
+            p90 as f64 / 1e6
+        );
+        let delivered = rtts.len() as f64 * 1200.0 / 4.0;
+        assert!(
+            delivered >= 0.8 * BW * 0.3,
+            "delivered {:.0} % of the lower rate",
+            100.0 * delivered / (BW * 0.3)
+        );
     }
 
     fn random_loss_tolerant_config() -> Bbr3Config {
