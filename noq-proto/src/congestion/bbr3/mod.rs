@@ -298,6 +298,11 @@ pub struct Bbr3 {
     /// point in the last packet-timed round trip. Transport-provided (via `on_cwnd_limited`);
     /// snapshotted from `cwnd_limited_this_round` at each round boundary.
     is_cwnd_limited: bool,
+    /// See [`Bbr3Config::random_loss_tolerant`].
+    random_loss_tolerant: bool,
+    /// The path's smoothed RTT and its variation, as of the last ACK.
+    smoothed_rtt: Duration,
+    rtt_variation: Duration,
     /// Whether `inflight_longterm` held the window at the last window update. Probing raises
     /// `inflight_longterm` a few bytes per ACK before the window follows, so comparing the two
     /// mid-ACK would almost never find the window at the bound.
@@ -621,6 +626,9 @@ impl Bbr3 {
             delivered: 0,
             inflight: 0,
             is_cwnd_limited: false,
+            random_loss_tolerant: config.random_loss_tolerant,
+            smoothed_rtt: Duration::ZERO,
+            rtt_variation: Duration::ZERO,
             cwnd_at_longterm: false,
             cwnd_limited_this_round: false,
             cycle_count: 0,
@@ -1495,6 +1503,10 @@ impl Bbr3 {
 
     /// equivalent to BBRHandleLostPacket <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-11>
     fn process_lost_packet(&mut self, packet_index: usize, space: SpaceKind, now: Instant) {
+        if self.loss_is_random() {
+            self.packets[space as usize].remove(packet_index);
+            return;
+        }
         let p = self.packets[space as usize][packet_index];
         self.enter_recovery(now, p.send_time);
         self.note_loss(space, p.packet_number);
@@ -1514,6 +1526,18 @@ impl Bbr3 {
             }
         }
         self.packets[space as usize].remove(packet_index);
+    }
+
+    /// Whether a loss now is taken for random loss: see [`Bbr3Config::random_loss_tolerant`].
+    fn loss_is_random(&self) -> bool {
+        if !self.random_loss_tolerant
+            || self.min_rtt == Duration::from_secs(u64::MAX)
+            || self.smoothed_rtt.is_zero()
+        {
+            return false;
+        }
+        let queueing = self.smoothed_rtt.saturating_sub(self.min_rtt);
+        queueing < self.min_rtt / 2 + 2 * self.rtt_variation
     }
 
     /// equivalent to BBRNoteLoss <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-11>
@@ -1676,6 +1700,8 @@ impl Bbr3 {
         _app_limited: bool,
         rtt: &RttEstimator,
     ) {
+        self.smoothed_rtt = rtt.get();
+        self.rtt_variation = rtt.var();
         self.check_recovery_done(sent);
         self.delivered += bytes;
         self.delivered_time = Some(now);
@@ -2024,9 +2050,20 @@ pub struct Bbr3Config {
     drain_pacing_gain: Option<f64>,
     pacing_margin_percent: Option<f64>,
     default_cwnd_gain: Option<f64>,
+    random_loss_tolerant: bool,
 }
 
 impl Bbr3Config {
+    /// Takes a loss for congestion only while the smoothed RTT shows a queue beyond the path's
+    /// usual jitter: more than half the minimum RTT plus twice the RTT variation above it.
+    /// Other losses, such as a radio link's, are still retransmitted but leave the rate model
+    /// alone; without this, random loss above 2 % of a small window holds BBR far below the
+    /// path's rate. Off by default.
+    pub fn random_loss_tolerant(&mut self, enabled: bool) -> &mut Self {
+        self.random_loss_tolerant = enabled;
+        self
+    }
+
     /// Default limit on the amount of outstanding data in bytes.
     ///
     /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
@@ -2052,6 +2089,7 @@ impl Default for Bbr3Config {
             drain_pacing_gain: None,
             pacing_margin_percent: None,
             default_cwnd_gain: None,
+            random_loss_tolerant: false,
         }
     }
 }
@@ -2235,6 +2273,7 @@ mod test {
             drain_pacing_gain: None,
             pacing_margin_percent: None,
             default_cwnd_gain: None,
+            random_loss_tolerant: false,
         };
         let mut bbr3 = Bbr3::new(Arc::new(config), 2500);
         bbr3.pick_probe_wait();
@@ -5467,6 +5506,121 @@ mod test {
         assert!(
             advances <= stopping_phases,
             "the max-bw filter advanced {advances} times in {stopping_phases} cycles"
+        );
+    }
+
+    /// Runs an always-backlogged, paced sender for 20 s over one 100 Mbit/s bottleneck with a
+    /// 20 ms RTT and a FIFO of `buffer_bytes`, also dropping the packets `drop` picks. Returns
+    /// the controller, the bytes delivered in the second half, and the bytes sent and lost.
+    fn run_lossy_link(
+        config: Bbr3Config,
+        buffer_bytes: f64,
+        drop: impl Fn(u64) -> bool,
+    ) -> (Bbr3, u64, u64, u64) {
+        const MSS: u64 = 1200;
+        const RTT_NS: u64 = 20_000_000;
+        const BW: f64 = 12_500_000.0;
+        const RUN_NS: u64 = 20_000_000_000;
+
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+        let service_ns = (MSS as f64 / BW * 1e9).round() as u64;
+
+        let mut flight: VecDeque<(u64, u64, u64, bool)> = VecDeque::new();
+        let (mut now_ns, mut next_send_ns, mut btl_free_ns) = (0u64, 0u64, 0u64);
+        let (mut inflight, mut pn) = (0u64, 0u64);
+        let (mut late_delivered, mut sent, mut lost) = (0u64, 0u64, 0u64);
+        while now_ns < RUN_NS {
+            let can_send = inflight + MSS <= bbr.window();
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_event = flight.front().map(|&(_, _, event_ns, _)| event_ns);
+            if can_send && next_event.is_none_or(|event| next_send_ns <= event) {
+                let send_ns = now_ns.max(next_send_ns);
+                now_ns = send_ns;
+                let arrival = send_ns + RTT_NS / 2;
+                let queued = btl_free_ns.saturating_sub(arrival) as f64 / service_ns as f64;
+                let overflow = queued * MSS as f64 > buffer_bytes;
+                let event_ns = if overflow {
+                    arrival.max(btl_free_ns) + RTT_NS / 2
+                } else {
+                    btl_free_ns = arrival.max(btl_free_ns) + service_ns;
+                    btl_free_ns + RTT_NS / 2
+                };
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn, SpaceKind::Data);
+                inflight += MSS;
+                sent += MSS;
+                flight.push_back((pn, send_ns, event_ns, overflow || drop(pn)));
+                next_send_ns = send_ns + (MSS as f64 / bbr.pacing_rate.max(1.0) * 1e9) as u64;
+                pn += 1;
+                continue;
+            }
+            let (number, send_ns, event_ns, dropped) = flight.pop_front().expect("data in flight");
+            now_ns = now_ns.max(event_ns);
+            inflight -= MSS;
+            if dropped {
+                lost += MSS;
+                bbr.on_packet_lost(MSS as u16, number, SpaceKind::Data, at(now_ns));
+                continue;
+            }
+            rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - send_ns));
+            bbr.on_ack(
+                at(now_ns),
+                at(send_ns),
+                MSS,
+                number,
+                SpaceKind::Data,
+                false,
+                &rtt_est,
+            );
+            bbr.on_end_acks(at(now_ns), inflight, false, Some(number), SpaceKind::Data);
+            if now_ns > RUN_NS / 2 {
+                late_delivered += MSS;
+            }
+        }
+        (bbr, late_delivered, sent, lost)
+    }
+
+    fn random_loss_tolerant_config() -> Bbr3Config {
+        let mut config = Bbr3Config {
+            probe_rng_seed: Some([9; 16]),
+            ..Bbr3Config::default()
+        };
+        config.random_loss_tolerant(true);
+        config
+    }
+
+    /// With random loss tolerated, 2 % loss in bursts of three on a path with no queue leaves
+    /// BBR near the path's rate.
+    #[test]
+    fn random_loss_leaves_the_rate_alone() {
+        const BW: f64 = 12_500_000.0;
+        let config = random_loss_tolerant_config();
+        let (_, delivered, _, _) = run_lossy_link(config, BW * 0.02, |pn| pn % 150 < 3);
+        let rate = delivered as f64 / 10.0;
+        assert!(
+            rate >= 0.85 * BW,
+            "delivered {:.1} % of the bottleneck",
+            100.0 * rate / BW
+        );
+    }
+
+    /// What tolerating random loss costs: in a buffer too shallow for its queue to stand out
+    /// from jitter, a quarter of the path's BDP, overflow passes for random loss, yet the
+    /// flow keeps its rate and loses little.
+    #[test]
+    fn random_loss_tolerance_keeps_overflow_small() {
+        const BW: f64 = 12_500_000.0;
+        let config = random_loss_tolerant_config();
+        let (_, delivered, sent, lost) = run_lossy_link(config, BW * 0.02 / 4.0, |_| false);
+        let rate = delivered as f64 / 10.0;
+        assert!(rate >= 0.9 * BW, "delivered {:.1} %", 100.0 * rate / BW);
+        assert!(
+            (lost as f64) < 0.02 * sent as f64,
+            "lost {lost} of {sent} bytes"
         );
     }
 
