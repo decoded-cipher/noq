@@ -1043,10 +1043,12 @@ async fn datagram_bound_to_a_path() {
         .send_datagram_on_path(PathId::ZERO, b"bound"[..].into())
         .unwrap();
     assert_eq!(client_conn.read_datagram().await.unwrap(), b"bound"[..]);
+    assert_eq!(server_conn.datagrams_queued_on_path(PathId::ZERO), 0);
     assert_eq!(
         server_conn.send_datagram_on_path(PathId::MAX, b"lost"[..].into()),
         Err(SendDatagramError::PathClosed)
     );
+    assert_eq!(server_conn.datagrams_queued_on_path(PathId::MAX), 0);
 }
 
 #[tokio::test]

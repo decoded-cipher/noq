@@ -734,6 +734,17 @@ impl Connection {
         }
     }
 
+    /// Payload bytes of datagrams sent with
+    /// [`send_datagram_on_path()`](Self::send_datagram_on_path) that are still queued for
+    /// `path`, waiting for its congestion window
+    pub fn datagrams_queued_on_path(&self, path: PathId) -> usize {
+        self.0
+            .lock_without_waking("datagrams_queued_on_path")
+            .inner
+            .datagrams()
+            .queued_on_path(path)
+    }
+
     /// Transmit many unreliable, unordered application datagrams in a single call.
     ///
     /// This is the batch analogue of [`send_datagram()`]: it queues the whole batch
