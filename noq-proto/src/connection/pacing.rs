@@ -21,6 +21,9 @@ pub(super) struct Pacer {
     tokens: u64,
     max_bytes_per_second: Option<u64>,
     prev: Instant,
+    /// When the last delay asked to be polled again. Time past it went to a late timer, not
+    /// to the sender, so it is credited beyond the burst budget, up to [`MAX_BURST_INTERVAL`].
+    wake_at: Option<Instant>,
 }
 
 /// Inputs a window-derived [`Pacer::capacity`] was calculated from.
@@ -49,6 +52,7 @@ impl Pacer {
             tokens: capacity,
             max_bytes_per_second,
             prev: now,
+            wake_at: None,
         }
     }
 
@@ -191,11 +195,23 @@ impl Pacer {
         });
         let new_tokens = (rate as f64 * time_elapsed.as_secs_f64()) as u64;
 
+        // A timer that fires late would otherwise forfeit everything earned past the burst
+        // budget: at a 2 ms budget, a wake 2 ms late halves the rate. Credit the lateness once.
+        let late = self.wake_at.take().map_or(Duration::ZERO, |at| {
+            now.saturating_duration_since(at).min(MAX_BURST_INTERVAL)
+        });
+        let limit = self
+            .capacity
+            .saturating_add((rate as f64 * late.as_secs_f64()) as u64);
+
         // Advance `prev` only once whole bytes have been earned, so elapsed time too short to
         // pay for a single byte is carried over rather than discarded. Without this, a slow
         // rate polled frequently would never accumulate anything.
         if new_tokens > 0 {
-            self.tokens = self.tokens.saturating_add(new_tokens).min(self.capacity);
+            // Never below what is held, so credit for a late wake survives the next poll.
+            self.tokens = self
+                .tokens
+                .max(self.tokens.saturating_add(new_tokens).min(limit));
             self.prev = now;
         }
 
@@ -209,7 +225,9 @@ impl Pacer {
         // Wait for the shortfall only. Deriving the delay from `bytes_to_send` would re-arm
         // the same interval on every poll and never retire, stalling the connection.
         let deficit = target - self.tokens;
-        Some(Duration::from_secs_f64(deficit as f64 / rate as f64))
+        let delay = Duration::from_secs_f64(deficit as f64 / rate as f64);
+        self.wake_at = Some(now + delay);
+        Some(delay)
     }
 }
 
@@ -441,6 +459,64 @@ mod tests {
             sent + slack >= expected,
             "emitted {sent} bytes in {SECONDS}s, underrunning pacing_rate {expected}"
         );
+    }
+
+    /// A pacing timer that fires late, as user-space timers do, must not cost throughput: the
+    /// time it overslept is credited rather than lost to the burst budget.
+    #[test]
+    fn late_timers_keep_the_pacing_rate() {
+        const LATE: Duration = Duration::from_millis(3);
+
+        let mtu = 1500;
+        let rtt = Duration::from_millis(50);
+        let window = 2_000_000;
+        let metrics = paced_metrics(window, TEST_PACING_RATE, 2 * u64::from(mtu));
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+
+        let (mut at, mut sent) = (start, 0);
+        while at < start + Duration::from_secs(1) {
+            match pacer.delay(rtt, u64::from(mtu), mtu, at, &metrics) {
+                None => {
+                    pacer.on_transmit(mtu);
+                    sent += u64::from(mtu);
+                }
+                Some(resume) => at += resume + LATE,
+            }
+        }
+
+        let expected = TEST_PACING_RATE;
+        assert!(
+            sent + expected / 20 >= expected,
+            "emitted {sent} bytes in 1s with timers {LATE:?} late, pacing_rate {expected}"
+        );
+        assert!(
+            sent <= expected + expected / 20,
+            "emitted {sent} bytes, above the rate"
+        );
+    }
+
+    /// The credit for a late wake is bounded, so a sender that comes back long after its timer
+    /// still bursts no more than the budget plus [`MAX_BURST_INTERVAL`] at the rate.
+    #[test]
+    fn late_credit_is_bounded() {
+        let mtu = 1500;
+        let rtt = Duration::from_millis(50);
+        let window = 2_000_000;
+        let metrics = paced_metrics(window, TEST_PACING_RATE, 2 * u64::from(mtu));
+        let now = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, now);
+
+        let (resume, _) = burst_until_blocked(&mut pacer, rtt, mtu, now, &metrics)
+            .expect("pacer must block once the burst budget is spent");
+        let later = now + resume + Duration::from_secs(1);
+        let (_, burst) = burst_until_blocked(&mut pacer, rtt, mtu, later, &metrics)
+            .expect("pacer must block again");
+
+        let bound = pacer.capacity
+            + (TEST_PACING_RATE as f64 * MAX_BURST_INTERVAL.as_secs_f64()) as u64
+            + u64::from(mtu);
+        assert!(burst <= bound, "burst {burst} bytes, bound {bound}");
     }
 
     #[test]
