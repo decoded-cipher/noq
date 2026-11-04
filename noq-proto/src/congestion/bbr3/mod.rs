@@ -223,9 +223,6 @@ struct BbrPacket {
     /// been flagged acknowledged hence the necessity of this flag being set before we remove
     /// it from packets.
     acknowledged: bool,
-    /// once a packet has been acknowledged on a given round it is marked for removal on the next
-    /// round.
-    stale: bool,
     /// used to mark packets stale if they're far from the current round <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.1>
     round_count: u64,
 }
@@ -1707,7 +1704,6 @@ impl Bbr3 {
             size: bytes,
             lost: self.lost,
             acknowledged: false,
-            stale: false,
             round_count: self.round_count,
         });
     }
@@ -1817,12 +1813,17 @@ impl Bbr3 {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
             let round_count = self.round_count;
+            let finished =
+                |p: &BbrPacket| p.acknowledged || round_count - p.round_count > ROUND_COUNT_WINDOW;
+            // Packets finish in about the order they were sent: drop finished ones from the
+            // front on every ACK, and sweep out those acknowledged out of order once a round.
+            // Walking every packet on every ACK cost O(inflight) per ACK.
             for packets in self.packets.iter_mut() {
-                packets.retain(|&p| !p.stale);
-                for p in packets.iter_mut() {
-                    if p.acknowledged || round_count - p.round_count > ROUND_COUNT_WINDOW {
-                        p.stale = true;
-                    }
+                while packets.front().is_some_and(finished) {
+                    packets.pop_front();
+                }
+                if self.round_start {
+                    packets.retain(|p| !finished(p));
                 }
             }
             if let Some(mut rate_sample) = self.rs {
@@ -1881,7 +1882,9 @@ impl Bbr3 {
         self.lost += lost_bytes_64;
         let p_index_result =
             self.packets[space as usize].binary_search_by_key(&packet_number, |p| p.packet_number);
-        if let Ok(p_index) = p_index_result {
+        if let Ok(p_index) = p_index_result
+            && !self.packets[space as usize][p_index].acknowledged
+        {
             self.process_lost_packet(p_index, space, now);
         }
     }
