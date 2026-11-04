@@ -281,7 +281,13 @@ impl<'a> SendStream<'a> {
             return Err(WriteError::Blocked);
         }
 
-        let limit = self.state.write_limit();
+        let priority = self
+            .state
+            .send
+            .get(&self.id)
+            .and_then(|s| s.as_ref())
+            .map_or(0, |s| s.priority);
+        let limit = self.state.write_limit_for(priority);
 
         let max_send_data = self.state.max_send_data(self.id);
 

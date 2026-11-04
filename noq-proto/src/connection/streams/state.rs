@@ -107,6 +107,8 @@ pub struct StreamsState {
     pub(super) connection_blocked: Vec<StreamId>,
     /// Connection-level flow control budget dictated by the peer
     pub(super) max_data: u64,
+    /// The peer's initial connection-level window
+    peer_window: u64,
     /// The initial receive window
     receive_window: u64,
     /// Limit on incoming data, which is transmitted through `MAX_DATA` frames
@@ -168,6 +170,7 @@ impl StreamsState {
             events: VecDeque::new(),
             connection_blocked: Vec::new(),
             max_data: 0,
+            peer_window: 0,
             receive_window: receive_window.into(),
             local_max_data: receive_window.into(),
             sent_max_data: receive_window,
@@ -191,6 +194,7 @@ impl StreamsState {
         self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
         self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
         self.received_max_data(params.initial_max_data);
+        self.peer_window = params.initial_max_data.into();
         for (&id, slot) in self.send.iter_mut() {
             if id.initiator() != self.side
                 && id.dir() == Dir::Bi
@@ -745,6 +749,17 @@ impl StreamsState {
             .min(self.send_window.saturating_sub(self.unacked_data))
     }
 
+    /// [`Self::write_limit`] for a stream of `priority`. Streams below the default priority
+    /// leave an eighth of the smaller window, ours or the peer's, to the others, so busy
+    /// low-priority streams cannot keep them waiting for room.
+    pub(crate) fn write_limit_for(&self, priority: i32) -> u64 {
+        let limit = self.write_limit();
+        if priority >= 0 {
+            return limit;
+        }
+        limit.saturating_sub(self.send_window.min(self.peer_window) / 8)
+    }
+
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
@@ -753,7 +768,20 @@ impl StreamsState {
         }
 
         if self.write_limit() > 0 {
-            while let Some(id) = self.connection_blocked.pop() {
+            let mut next = self.connection_blocked.len();
+            while next > 0 {
+                next -= 1;
+                let id = self.connection_blocked[next];
+                let priority = self
+                    .send
+                    .get(&id)
+                    .and_then(|s| s.as_ref())
+                    .map_or(0, |s| s.priority);
+                // Woken only once there is room at its priority
+                if self.write_limit_for(priority) == 0 {
+                    continue;
+                }
+                self.connection_blocked.remove(next);
                 let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
                     continue;
                 };
@@ -2353,6 +2381,61 @@ mod tests {
         assert_eq!(stream.write(&data), Ok(initial_send_len));
         assert_eq!(stream.write(&data), Ok(initial_send_len));
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+    }
+
+    #[test]
+    fn low_priority_streams_leave_room_for_others() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: VarInt::from_u32(100),
+            ..TransportParameters::default()
+        });
+        let window = server.send_window as usize;
+        let reserve = window / 8;
+        let mut retransmits = Retransmits::default();
+        let conn_state = ConnState::established();
+        let mut streams = Streams {
+            state: &mut server,
+            conn_state: &conn_state,
+        };
+        let (bulk, other) = (
+            streams.open(Dir::Uni).expect("a stream"),
+            streams.open(Dir::Uni).expect("a stream"),
+        );
+        macro_rules! stream {
+            ($id:expr) => {
+                SendStream {
+                    id: $id,
+                    state: &mut server,
+                    pending: &mut retransmits,
+                    conn_state: &conn_state,
+                }
+            };
+        }
+
+        stream!(bulk).set_priority(-1).unwrap();
+        let data = vec![0xFFu8; window];
+        assert_eq!(stream!(bulk).write(&data), Ok(window - reserve));
+        assert_eq!(stream!(bulk).write(&data), Err(WriteError::Blocked));
+        assert_eq!(stream!(other).write(&data), Ok(reserve));
+        assert_eq!(stream!(other).write(&data), Err(WriteError::Blocked));
+
+        // Room below the reserve wakes the default-priority stream only
+        server.received_ack_of(frame::StreamMeta {
+            id: other,
+            offsets: 0..reserve as u64,
+            fin: false,
+        });
+        assert_eq!(server.poll(), Some(StreamEvent::Writable { id: other }));
+        assert_eq!(server.poll(), None);
+        server.received_ack_of(frame::StreamMeta {
+            id: bulk,
+            offsets: 0..reserve as u64,
+            fin: false,
+        });
+        assert_eq!(server.poll(), Some(StreamEvent::Writable { id: bulk }));
     }
 
     #[test]
