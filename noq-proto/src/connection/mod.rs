@@ -3367,7 +3367,9 @@ impl Connection {
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, path_id: PathId, pn: u64, info: SentPacket) {
-        self.path_stats.get_mut(path_id).acked_packets += 1;
+        let stats = self.path_stats.get_mut(path_id);
+        stats.acked_packets += 1;
+        stats.latest_acked_sent = stats.latest_acked_sent.max(Some(info.time_sent));
         let path = self.path_data_mut(path_id);
         let app_limited = path.app_limited;
         path.remove_in_flight(&info);

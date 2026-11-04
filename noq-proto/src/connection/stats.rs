@@ -3,6 +3,7 @@
 use crate::Duration;
 use crate::FrameType;
 use crate::FxHashMap;
+use crate::Instant;
 
 use super::PathId;
 
@@ -264,6 +265,11 @@ pub struct PathStats {
     pub sent_bytes: u64,
     /// The number of packets sent on this path that have been acknowledged, on any path.
     pub acked_packets: u64,
+    /// When the newest acknowledged packet sent on this path was sent.
+    ///
+    /// Acknowledgements can arrive late over another path, so this, not their arrival,
+    /// tells how recently the path itself delivered.
+    pub latest_acked_sent: Option<Instant>,
     /// The number of packets lost on this path.
     ///
     /// This counts all packets declared lost, including MTUD probes. More specific counters
@@ -340,6 +346,7 @@ impl core::ops::Add<PathStats> for ConnectionStats {
             rtt_variance: _,
             bytes_in_flight: _,
             acked_packets: _,
+            latest_acked_sent: _,
             udp_tx,
             udp_rx,
             frame_tx,
@@ -384,6 +391,7 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
             rtt_variance: _,
             bytes_in_flight: _,
             acked_packets: _,
+            latest_acked_sent: _,
             udp_tx: path_udp_tx,
             udp_rx: path_udp_rx,
             frame_tx: path_frame_tx,
