@@ -198,6 +198,10 @@ pub(super) struct PathData {
     /// window.
     pub(super) app_limited: bool,
 
+    /// Set by the current `poll_transmit` when the data space stopped because it had nothing
+    /// more to send on this path, whether or not it wrote packets first.
+    pub(super) ran_dry: bool,
+
     /// Whether to trigger sending another PATH_CHALLENGE in the next poll_transmit.
     ///
     /// This is picked up by [`super::Connection::space_can_send`]. These are **not**
@@ -331,6 +335,7 @@ impl PathData {
             ),
             congestion,
             app_limited: false,
+            ran_dry: false,
             unconfirmed_challenges: Default::default(),
             lost_challenge_count: 0,
             pending_challenge: false,
@@ -394,6 +399,7 @@ impl PathData {
             sending_ecn: true,
             congestion,
             app_limited: false,
+            ran_dry: false,
             unconfirmed_challenges: Default::default(),
             lost_challenge_count: 0,
             pending_challenge: false,

@@ -245,6 +245,37 @@ fn stats_include_congestion_controller_bandwidth_estimate() {
     assert_eq!(stats.bandwidth_estimate, Some(BANDWIDTH_ESTIMATE));
 }
 
+/// A connection that carries nothing but keep-alives stays in BBR's Startup: a send that runs
+/// dry is application-limited even when it sent a probe, so the probes' tiny delivery rate is
+/// not taken for the path's, and the window does not fall to the minimum before data flows.
+#[test]
+fn keep_alives_alone_leave_bbr_in_startup() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig {
+        initial_rtt: Duration::from_millis(10),
+        ..TransportConfig::default()
+    };
+    transport
+        .congestion_controller_factory(Arc::new(crate::congestion::Bbr3Config::default()))
+        .keep_alive_interval(Some(Duration::from_millis(200)));
+    let mut pair = ConnPair::builder()
+        .with_latency(Duration::from_millis(10))
+        .with_transport_cfg(transport)
+        .connect();
+    let start = pair.path_stats(Client, PathId::ZERO).unwrap().cwnd;
+
+    let end = pair.time + Duration::from_secs(3);
+    while pair.time < end && pair.advance_time() {
+        pair.drive_client();
+        pair.drive_server();
+    }
+    let idle = pair.path_stats(Client, PathId::ZERO).unwrap().cwnd;
+    assert!(
+        idle >= start,
+        "the window fell from {start} to {idle} bytes on keep-alives alone"
+    );
+}
+
 #[test]
 fn draft_version_compat() {
     let _guard = subscribe();

@@ -1813,7 +1813,11 @@ impl Bbr3 {
         if largest_packet_num_acked.is_some() {
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
-            } else if app_limited {
+            }
+            // Separate from ending the last bubble: a sender still short of data starts the
+            // next at once, or the packet it sends next, such as a keep-alive on an idle path,
+            // would pass for one sent at full rate and end Startup at its delivery rate.
+            if app_limited {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
             let round_count = self.round_count;

@@ -1480,6 +1480,7 @@ impl Connection {
         // Set when either the congestion window or the pacer held a send back; drives
         // `app_limited`, since neither case means the application ran dry.
         let mut send_blocked = false;
+        self.path_data_mut(path_id).ran_dry = false;
         // Set only when the congestion window itself was full. This is the spec's
         // `C.is_cwnd_limited`, which a pacing delay must not stand in for.
         let mut cwnd_blocked = false;
@@ -1573,7 +1574,10 @@ impl Connection {
 
         let path = self.path_data_mut(path_id);
 
-        path.app_limited = last_packet_number.is_none() && !send_blocked;
+        // Running out of data is what makes a send application-limited, even when packets went
+        // out first: a keep-alive or probe sent on an otherwise idle path is not a sample of
+        // what the path can carry, and taking it for one ends BBR's Startup at the probes' rate.
+        path.app_limited = !send_blocked && (last_packet_number.is_none() || path.ran_dry);
 
         if cwnd_blocked {
             path.congestion.on_cwnd_limited();
@@ -1678,6 +1682,9 @@ impl Connection {
             if !space_will_send {
                 // Nothing more to send. Previous iterations of this loop may have built
                 // packets already.
+                if space_id == SpaceId::Data {
+                    self.path_data_mut(path_id).ran_dry = true;
+                }
                 return match last_packet_number {
                     Some(pn) => PollPathSpaceStatus::WrotePacket {
                         last_packet_number: pn,
