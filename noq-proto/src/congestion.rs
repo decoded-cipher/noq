@@ -4,6 +4,7 @@ use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
 use alloc::{boxed::Box, sync::Arc};
 use core::any::Any;
+use core::net::SocketAddr;
 
 mod bbr3;
 mod cubic;
@@ -153,6 +154,18 @@ pub struct ControllerMetrics {
 pub trait ControllerFactory {
     /// Construct a fresh `Controller`
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller>;
+
+    /// Construct a fresh `Controller` for a path to `remote`, so that paths of different kinds
+    /// can be controlled differently; by default the same as [`Self::build`]
+    fn build_for_path(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+        remote: SocketAddr,
+    ) -> Box<dyn Controller> {
+        let _ = remote;
+        self.build(now, current_mtu)
+    }
 }
 
 const BASE_DATAGRAM_SIZE: u64 = 1200;

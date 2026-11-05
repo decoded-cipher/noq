@@ -313,10 +313,11 @@ impl PathData {
         now: Instant,
         config: &TransportConfig,
     ) -> Self {
-        let congestion = config
-            .congestion_controller_factory
-            .clone()
-            .build(now, config.get_initial_mtu());
+        let congestion = config.congestion_controller_factory.clone().build_for_path(
+            now,
+            config.get_initial_mtu(),
+            network_path.remote(),
+        );
         Self {
             network_path,
             rtt: RttEstimator::new(config.initial_rtt),

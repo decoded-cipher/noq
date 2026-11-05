@@ -357,6 +357,8 @@ pub struct Bbr3 {
     /// the sending rate to double each round (2) BBRStartupCwndGain. Used by default in most
     /// phases for BBR.cwnd_gain.
     default_cwnd_gain: f64,
+    /// The cwnd gain in ProbeBW outside of probing up; [`Self::default_cwnd_gain`] unless set.
+    probe_bw_cwnd_gain: f64,
     /// used to generate random numbers when deciding how long to wait before probing again
     /// using Pcg32 as it's a fast general purpose random number generator and fits our purpose
     /// here these numbers will not be security critical as they're only used to decide when to
@@ -618,6 +620,7 @@ impl Bbr3 {
             .pacing_margin_percent
             .unwrap_or(PACING_MARGIN_PERCENT);
         let default_cwnd_gain = config.default_cwnd_gain.unwrap_or(DEFAULT_CWND_GAIN);
+        let probe_bw_cwnd_gain = config.probe_bw_cwnd_gain.unwrap_or(default_cwnd_gain);
         let probe_bw_up_cwnd_gain = config
             .probe_bw_up_cwnd_gain
             .unwrap_or(PROBE_BW_UP_CWND_GAIN);
@@ -651,6 +654,7 @@ impl Bbr3 {
             pacing_margin_percent,
             cwnd_gain: default_cwnd_gain,
             default_cwnd_gain,
+            probe_bw_cwnd_gain,
             probe_rng,
             probe_bw_up_cwnd_gain,
             state: BbrState::Startup,
@@ -976,7 +980,7 @@ impl Bbr3 {
 
     /// equivalent to BBREnterProbeBW <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6>
     fn enter_probe_bw(&mut self, now: Instant) {
-        self.cwnd_gain = self.default_cwnd_gain;
+        self.cwnd_gain = self.probe_bw_cwnd_gain;
         self.start_probe_bw_down(now);
     }
 
@@ -1091,7 +1095,7 @@ impl Bbr3 {
         self.bw_probe_up_acks = 0;
         self.ack_phase = AckPhase::Refilling;
         self.start_round();
-        self.cwnd_gain = self.default_cwnd_gain;
+        self.cwnd_gain = self.probe_bw_cwnd_gain;
         self.pacing_gain = self.default_pacing_gain;
         self.state = BbrState::ProbeBw(ProbeBwSubstate::Refill);
     }
@@ -1338,7 +1342,7 @@ impl Bbr3 {
     fn start_probe_bw_cruise(&mut self) {
         self.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
         self.pacing_gain = self.default_pacing_gain;
-        self.cwnd_gain = self.default_cwnd_gain;
+        self.cwnd_gain = self.probe_bw_cwnd_gain;
     }
 
     /// equivalent to BBREnterStartup <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.1.1-3>
@@ -1655,7 +1659,7 @@ impl Bbr3 {
         self.ack_phase = AckPhase::ProbeStopping;
         self.start_round();
         self.pacing_gain = self.probe_bw_down_pacing_gain;
-        self.cwnd_gain = self.default_cwnd_gain;
+        self.cwnd_gain = self.probe_bw_cwnd_gain;
         self.state = BbrState::ProbeBw(ProbeBwSubstate::Down);
     }
 
@@ -2086,6 +2090,7 @@ pub struct Bbr3Config {
     drain_pacing_gain: Option<f64>,
     pacing_margin_percent: Option<f64>,
     default_cwnd_gain: Option<f64>,
+    probe_bw_cwnd_gain: Option<f64>,
     random_loss_tolerant: bool,
     queue_sensitive: bool,
 }
@@ -2109,6 +2114,16 @@ impl Bbr3Config {
     /// path's rate. Off by default.
     pub fn random_loss_tolerant(&mut self, enabled: bool) -> &mut Self {
         self.random_loss_tolerant = enabled;
+        self
+    }
+
+    /// The cwnd gain in ProbeBW outside of probing up: the multiple of the estimated BDP kept in
+    /// flight once the bandwidth is found, 2 by default as in the draft. Where delivery comes in
+    /// bursts, as through a TCP tunnel, the max-bw filter runs above the path's average rate and
+    /// the whole window's excess stands in a queue; a smaller gain shortens that queue. Startup
+    /// and Drain keep the default gain.
+    pub fn probe_bw_cwnd_gain(&mut self, gain: f64) -> &mut Self {
+        self.probe_bw_cwnd_gain = Some(gain);
         self
     }
 
@@ -2137,6 +2152,7 @@ impl Default for Bbr3Config {
             drain_pacing_gain: None,
             pacing_margin_percent: None,
             default_cwnd_gain: None,
+            probe_bw_cwnd_gain: None,
             random_loss_tolerant: false,
             queue_sensitive: false,
         }
@@ -2322,6 +2338,7 @@ mod test {
             drain_pacing_gain: None,
             pacing_margin_percent: None,
             default_cwnd_gain: None,
+            probe_bw_cwnd_gain: None,
             random_loss_tolerant: false,
             queue_sensitive: false,
         };
@@ -5662,6 +5679,48 @@ mod test {
     ) -> (Bbr3, u64, u64, u64) {
         let run = run_link(config, buffer_bytes, drop, |_| 12_500_000.0);
         (run.bbr, run.late_delivered, run.sent, run.lost)
+    }
+
+    /// Where delivery comes in bursts above and below its average, as through a TCP tunnel, a
+    /// smaller ProbeBW cwnd gain keeps a shorter standing queue and delivers about as much.
+    #[test]
+    fn a_smaller_probe_bw_gain_shortens_the_queue_under_bursty_delivery() {
+        const BW: f64 = 12_500_000.0;
+        let bursty = |ns: u64| {
+            if (ns / 10_000_000).is_multiple_of(2) {
+                BW * 1.4
+            } else {
+                BW * 0.6
+            }
+        };
+        let run = |gain: Option<f64>| {
+            let mut config = Bbr3Config {
+                probe_rng_seed: Some([9; 16]),
+                ..Bbr3Config::default()
+            };
+            if let Some(gain) = gain {
+                config.probe_bw_cwnd_gain(gain);
+            }
+            let run = run_link(config, BW * 0.02 * 4.0, |_| false, bursty);
+            let mut rtts: Vec<u64> = run
+                .acks
+                .iter()
+                .filter(|(at, _)| *at >= 10_000_000_000)
+                .map(|&(_, rtt)| rtt)
+                .collect();
+            rtts.sort_unstable();
+            (rtts[rtts.len() * 9 / 10] as f64 / 1e6, run.late_delivered)
+        };
+        let (default_p90, default_delivered) = run(None);
+        let (small_p90, small_delivered) = run(Some(1.25));
+        assert!(
+            small_p90 + 8.0 < default_p90,
+            "P90 RTT {small_p90:.1} ms with gain 1.25, {default_p90:.1} ms with 2"
+        );
+        assert!(
+            small_delivered as f64 >= 0.95 * default_delivered as f64,
+            "delivered {small_delivered} with gain 1.25, {default_delivered} with 2"
+        );
     }
 
     /// When the rate under a deep buffer drops to 30 % for 6 s, a queue-sensitive BBR keeps the
