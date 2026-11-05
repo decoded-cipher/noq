@@ -2930,6 +2930,23 @@ fn declaring_a_path_lost_keeps_its_congestion_window() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn acknowledged_stream_data_is_counted_once() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let before = pair.conn_mut(Client).stats().stream_bytes_acked;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(&[0; 100_000])?;
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive_client();
+    // The first flight is lost and sent again.
+    pair.server.inbound.clear();
+    pair.drive();
+    let acked = pair.conn_mut(Client).stats().stream_bytes_acked - before;
+    assert_eq!(acked, 100_000);
+    Ok(())
+}
+
 /// Builds Cubic, recording each path it builds for.
 struct Recording(std::sync::Mutex<Vec<PathId>>);
 

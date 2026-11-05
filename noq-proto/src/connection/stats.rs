@@ -329,6 +329,9 @@ pub struct ConnectionStats {
     pub key_updates: u64,
     /// The number of received packets dropped because they failed authentication.
     pub authentication_failures: u64,
+    /// Stream data sent on the connection that the peer acknowledged, each byte once: what
+    /// the streams delivered, without retransmissions or data discarded by a reset.
+    pub stream_bytes_acked: u64,
 
     /// Number of [`super::Transmit`] produced by this connection.
     #[cfg(test)]
@@ -376,6 +379,7 @@ impl core::ops::Add<PathStats> for ConnectionStats {
             // Connection-level counters, not per path.
             key_updates: self.key_updates,
             authentication_failures: self.authentication_failures,
+            stream_bytes_acked: self.stream_bytes_acked,
             #[cfg(test)]
             transmits_tx: self.transmits_tx,
         }
@@ -420,6 +424,7 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
             lost_bytes,
             key_updates: _,
             authentication_failures: _,
+            stream_bytes_acked: _,
             #[cfg(test)]
                 transmits_tx: _,
         } = self;

@@ -122,6 +122,8 @@ pub struct StreamsState {
     data_recvd: u64,
     /// Total quantity of unacknowledged outgoing data
     pub(super) unacked_data: u64,
+    /// Outgoing stream data the peer has acknowledged, each byte once
+    acked_data: u64,
     /// Configured upper bound for `unacked_data`.
     ///
     /// Note this may be less than `unacked_data` if the user has set a new value.
@@ -177,6 +179,7 @@ impl StreamsState {
             data_sent: 0,
             data_recvd: 0,
             unacked_data: 0,
+            acked_data: 0,
             send_window,
             stream_receive_window: stream_receive_window.into(),
             initial_max_stream_data_uni: 0u32.into(),
@@ -626,7 +629,10 @@ impl StreamsState {
         let id = frame.id;
         self.unacked_data -= frame.offsets.end - frame.offsets.start;
         let was_pending = stream.is_pending();
-        if !stream.ack(frame) {
+        let before = stream.pending.fully_acked_offset();
+        let finished = stream.ack(frame);
+        self.acked_data += stream.pending.fully_acked_offset() - before;
+        if !finished {
             // The stream is unfinished or may still need retransmits
             return;
         }
@@ -637,6 +643,11 @@ impl StreamsState {
         entry.remove_entry();
         self.stream_freed(id, StreamHalf::Send);
         self.events.push_back(StreamEvent::Finished { id });
+    }
+
+    /// Outgoing stream data the peer has acknowledged, each byte once
+    pub(crate) fn acked_data(&self) -> u64 {
+        self.acked_data
     }
 
     pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) {

@@ -2880,6 +2880,7 @@ impl Connection {
         }
         stats.key_updates = self.crypto_state.key_updates;
         stats.authentication_failures = self.authentication_failures;
+        stats.stream_bytes_acked = self.streams.acked_data();
 
         stats
     }
