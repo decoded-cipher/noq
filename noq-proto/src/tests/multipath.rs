@@ -13,7 +13,8 @@ use crate::connection::timer::{PathTimer, Timer};
 use crate::{
     ClientConfig, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, FourTuple,
     Instant, LOCAL_CID_COUNT, NetworkChangeHint, PathChoice, PathError, PathId, PathScheduler,
-    PathSchedulerFactory, PathSnapshot, PathStatus, RandomConnectionIdGenerator, ServerConfig,
+    PathSchedulerFactory, PathSnapshot, PathStats, PathStatus, RandomConnectionIdGenerator,
+    ServerConfig,
     Side::{self, *},
     TransportConfig,
     cid_queue::CidQueue,
@@ -2926,6 +2927,39 @@ fn declaring_a_path_lost_keeps_its_congestion_window() -> TestResult {
     assert_eq!(after.congestion_events, before.congestion_events);
     assert!(after.cwnd >= before.cwnd);
     assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    Ok(())
+}
+
+#[test]
+fn a_ping_gets_past_a_window_an_outage_filled() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let path = PathId::ZERO;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(&[0; 1024 * 1024])?;
+    pair.drive_client();
+    pair.server.inbound.clear();
+    let now = pair.time;
+    pair.conn_mut(Client).declare_path_lost(path, now)?;
+
+    // What was declared lost is sent again into the outage, until the window is full.
+    let full = |stats: &PathStats| stats.bytes_in_flight + 1500 > stats.cwnd;
+    for _ in 0..10 {
+        pair.time += Duration::from_millis(1);
+        pair.drive_client();
+        pair.server.inbound.clear();
+        if full(&pair.path_stats(Client, path).unwrap()) {
+            break;
+        }
+    }
+    pair.time += Duration::from_millis(1);
+    pair.drive_client();
+    let blocked = pair.path_stats(Client, path).unwrap();
+    assert!(full(&blocked));
+
+    pair.conn_mut(Client).ping_path(path)?;
+    pair.drive_client();
+    assert!(pair.path_stats(Client, path).unwrap().sent_packets > blocked.sent_packets);
     Ok(())
 }
 

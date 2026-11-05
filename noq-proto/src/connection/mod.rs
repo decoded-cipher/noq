@@ -2139,9 +2139,14 @@ impl Connection {
         // Tail loss probes must not be blocked by congestion, or a deadlock could arise.
         let bytes_to_send = transmit.segment_size() as u64;
         let need_loss_probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
+        // Nor may the application's probes of a path it declared lost: its window is
+        // full of packets the outage took, and only an answered probe ends the outage.
+        let outage_probe =
+            self.path_data(path_id).outage && self.spaces[space_id].for_path(path_id).pending_ping;
 
         if (can_send.other || can_send.space_specific || can_send.unpinned_data)
             && !need_loss_probe
+            && !outage_probe
             && !can_send.close
         {
             let path = self.path_data(path_id);
