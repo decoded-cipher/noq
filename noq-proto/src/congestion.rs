@@ -1,7 +1,7 @@
 //! Logic for controlling the rate at which data is sent
 
 use crate::connection::RttEstimator;
-use crate::{Duration, Instant};
+use crate::{Duration, Instant, PathId};
 use alloc::{boxed::Box, sync::Arc};
 use core::any::Any;
 use core::net::SocketAddr;
@@ -165,6 +165,19 @@ pub trait ControllerFactory {
     ) -> Box<dyn Controller> {
         let _ = remote;
         self.build(now, current_mtu)
+    }
+
+    /// Construct a fresh `Controller` for path `path` to `remote`, so that each path can be
+    /// controlled on its own terms; by default the same as [`Self::build_for_path`]
+    fn build_for_path_id(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+        remote: SocketAddr,
+        path: PathId,
+    ) -> Box<dyn Controller> {
+        let _ = path;
+        self.build_for_path(now, current_mtu, remote)
     }
 }
 

@@ -395,7 +395,14 @@ impl Connection {
             paths: BTreeMap::from_iter([(
                 PathId::ZERO,
                 PathState {
-                    data: PathData::new(network_path, allow_mtud, None, 0, now, &config),
+                    data: PathData::new(
+                        (network_path, PathId::ZERO),
+                        allow_mtud,
+                        None,
+                        0,
+                        now,
+                        &config,
+                    ),
                     prev: None,
                 },
             )]),
@@ -1050,7 +1057,7 @@ impl Connection {
             u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX);
         self.path_generation_counter = self.path_generation_counter.wrapping_add(1);
         let mut data = PathData::new(
-            network_path,
+            (network_path, path_id),
             self.allow_mtud,
             Some(peer_max_udp_payload_size),
             self.path_generation_counter,
@@ -6001,7 +6008,7 @@ impl Connection {
                 u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
                     .unwrap_or(u16::MAX);
             PathData::new(
-                network_path,
+                (network_path, path_id),
                 self.allow_mtud,
                 Some(peer_max_udp_payload_size),
                 self.path_generation_counter,

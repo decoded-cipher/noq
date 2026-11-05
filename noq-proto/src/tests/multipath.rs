@@ -2930,6 +2930,43 @@ fn declaring_a_path_lost_keeps_its_congestion_window() -> TestResult {
     Ok(())
 }
 
+/// Builds Cubic, recording each path it builds for.
+struct Recording(std::sync::Mutex<Vec<PathId>>);
+
+impl crate::congestion::ControllerFactory for Recording {
+    fn build(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+    ) -> Box<dyn crate::congestion::Controller> {
+        Arc::new(crate::congestion::CubicConfig::default()).build(now, current_mtu)
+    }
+
+    fn build_for_path_id(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+        _remote: SocketAddr,
+        path: PathId,
+    ) -> Box<dyn crate::congestion::Controller> {
+        self.0.lock().unwrap().push(path);
+        self.build(now, current_mtu)
+    }
+}
+
+#[test]
+fn each_path_s_controller_is_built_for_its_id() -> TestResult {
+    let _guard = subscribe();
+    let recording = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(recording.clone());
+    pair_with_two_paths_and(transport)?;
+    let built = recording.0.lock().unwrap().clone();
+    assert!(built.contains(&PathId::ZERO), "{built:?}");
+    assert!(built.contains(&PathId(1)), "{built:?}");
+    Ok(())
+}
+
 #[test]
 fn a_ping_gets_past_a_window_an_outage_filled() -> TestResult {
     let _guard = subscribe();

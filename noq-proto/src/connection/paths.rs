@@ -310,18 +310,22 @@ pub(super) struct PathData {
 
 impl PathData {
     pub(super) fn new(
-        network_path: FourTuple,
+        (network_path, path_id): (FourTuple, PathId),
         allow_mtud: bool,
         peer_max_udp_payload_size: Option<u16>,
         generation: u64,
         now: Instant,
         config: &TransportConfig,
     ) -> Self {
-        let congestion = config.congestion_controller_factory.clone().build_for_path(
-            now,
-            config.get_initial_mtu(),
-            network_path.remote(),
-        );
+        let congestion = config
+            .congestion_controller_factory
+            .clone()
+            .build_for_path_id(
+                now,
+                config.get_initial_mtu(),
+                network_path.remote(),
+                path_id,
+            );
         Self {
             network_path,
             rtt: RttEstimator::new(config.initial_rtt),
