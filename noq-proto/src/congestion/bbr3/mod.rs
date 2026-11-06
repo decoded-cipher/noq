@@ -2072,6 +2072,13 @@ impl Controller for Bbr3 {
         Self::on_packet_lost(self, lost_bytes, pn, SpaceKind::Data, now);
     }
 
+    fn on_packet_lost_expected(&mut self, _lost_bytes: u16, pn: u64, _now: Instant) {
+        let packets = &mut self.packets[SpaceKind::Data as usize];
+        if let Ok(index) = packets.binary_search_by_key(&pn, |p| p.packet_number) {
+            packets.remove(index);
+        }
+    }
+
     fn on_spurious_congestion_event(&mut self) {
         Self::on_spurious_congestion_event(self)
     }
@@ -5616,17 +5623,18 @@ mod test {
         drop: impl Fn(u64) -> bool,
         rate: impl Fn(u64) -> f64,
     ) -> LinkRun {
-        run_link_with(config, buffer_bytes, drop, rate, |_, _| {})
+        run_link_with(config, buffer_bytes, drop, rate, |_, _| {}, |_| false)
     }
 
     /// [`run_link`], handing the controller to `each_ack` after every acknowledgement, with the
-    /// time in nanoseconds.
+    /// time in nanoseconds, and reporting the losses of the packets `expected` picks as expected.
     fn run_link_with(
         config: Bbr3Config,
         buffer_bytes: f64,
         drop: impl Fn(u64) -> bool,
         rate: impl Fn(u64) -> f64,
         mut each_ack: impl FnMut(u64, &mut Bbr3),
+        expected: impl Fn(u64) -> bool,
     ) -> LinkRun {
         const MSS: u64 = 1200;
         const RTT_NS: u64 = 20_000_000;
@@ -5674,7 +5682,11 @@ mod test {
             inflight -= MSS;
             if dropped {
                 lost += MSS;
-                bbr.on_packet_lost(MSS as u16, number, SpaceKind::Data, at(now_ns));
+                if expected(number) {
+                    Controller::on_packet_lost_expected(&mut bbr, MSS as u16, number, at(now_ns));
+                } else {
+                    bbr.on_packet_lost(MSS as u16, number, SpaceKind::Data, at(now_ns));
+                }
                 continue;
             }
             rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - send_ns));
@@ -5786,6 +5798,7 @@ mod test {
                     followed &= Controller::set_window_gain(bbr, None);
                 }
             },
+            |_| false,
         );
         assert!(followed);
         let p90 = |during: core::ops::Range<u64>| {
@@ -5804,6 +5817,36 @@ mod test {
         assert!(
             calmed + 8.0 < before && calmed + 8.0 < after,
             "P90 RTT {before:.1} ms, then {calmed:.1} ms with gain 1.25, then {after:.1} ms"
+        );
+    }
+
+    /// A burst of loss the application expected, as in a satellite dish's predicted delay
+    /// spike, leaves the rate alone when it is reported as expected, and costs it when it is
+    /// taken for congestion.
+    #[test]
+    fn expected_losses_leave_the_rate_alone() {
+        const BW: f64 = 12_500_000.0;
+        // About 10 400 packets a second: a tenth of those sent 12 to 12.3 s in.
+        let spike = |pn: u64| (125_000..128_125).contains(&pn) && pn.is_multiple_of(10);
+        let run = |expected: bool| {
+            let config = Bbr3Config {
+                probe_rng_seed: Some([9; 16]),
+                ..Bbr3Config::default()
+            };
+            run_link_with(
+                config,
+                BW * 0.02,
+                spike,
+                |_| BW,
+                |_, _| {},
+                |pn| expected && spike(pn),
+            )
+            .late_delivered
+        };
+        let (congestion, expected) = (run(false), run(true));
+        assert!(
+            expected as f64 > 1.02 * congestion as f64,
+            "delivered {expected} with the losses expected, {congestion} without"
         );
     }
 

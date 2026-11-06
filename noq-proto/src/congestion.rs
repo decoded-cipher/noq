@@ -106,6 +106,13 @@ pub trait Controller: Send + Sync + core::fmt::Debug {
     ) {
     }
 
+    /// One packet was lost to something other than congestion that the application expected,
+    /// such as a path's predicted delay spike: the controller forgets it without slowing down. By
+    /// default the same as [`Self::on_packet_lost`].
+    fn on_packet_lost_expected(&mut self, lost_bytes: u16, pn: u64, now: Instant) {
+        self.on_packet_lost(lost_bytes, pn, now);
+    }
+
     /// Holds the window, outside of probing for more bandwidth, to `gain` times the controller's
     /// estimate of the path's bandwidth-delay product, or gives it back its own with `None`: an
     /// application keeps the path's queue short this way while traffic that cannot wait shares
