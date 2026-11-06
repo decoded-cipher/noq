@@ -106,6 +106,15 @@ pub trait Controller: Send + Sync + core::fmt::Debug {
     ) {
     }
 
+    /// Holds the window, outside of probing for more bandwidth, to `gain` times the controller's
+    /// estimate of the path's bandwidth-delay product, or gives it back its own with `None`: an
+    /// application keeps the path's queue short this way while traffic that cannot wait shares
+    /// it. Returns whether the controller follows such a gain.
+    #[allow(unused_variables)]
+    fn set_window_gain(&mut self, gain: Option<f64>) -> bool {
+        false
+    }
+
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 

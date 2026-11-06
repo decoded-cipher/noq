@@ -359,6 +359,8 @@ pub struct Bbr3 {
     default_cwnd_gain: f64,
     /// The cwnd gain in ProbeBW outside of probing up; [`Self::default_cwnd_gain`] unless set.
     probe_bw_cwnd_gain: f64,
+    /// [`Self::probe_bw_cwnd_gain`] as configured, before any [`Controller::set_window_gain`].
+    configured_probe_bw_cwnd_gain: f64,
     /// used to generate random numbers when deciding how long to wait before probing again
     /// using Pcg32 as it's a fast general purpose random number generator and fits our purpose
     /// here these numbers will not be security critical as they're only used to decide when to
@@ -655,6 +657,7 @@ impl Bbr3 {
             cwnd_gain: default_cwnd_gain,
             default_cwnd_gain,
             probe_bw_cwnd_gain,
+            configured_probe_bw_cwnd_gain: probe_bw_cwnd_gain,
             probe_rng,
             probe_bw_up_cwnd_gain,
             state: BbrState::Startup,
@@ -2004,6 +2007,19 @@ impl Controller for Bbr3 {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         Self::into_any(self)
+    }
+
+    fn set_window_gain(&mut self, gain: Option<f64>) -> bool {
+        self.probe_bw_cwnd_gain = gain.unwrap_or(self.configured_probe_bw_cwnd_gain);
+        if matches!(
+            self.state,
+            BbrState::ProbeBw(
+                ProbeBwSubstate::Down | ProbeBwSubstate::Cruise | ProbeBwSubstate::Refill
+            )
+        ) {
+            self.cwnd_gain = self.probe_bw_cwnd_gain;
+        }
+        true
     }
 
     fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64) {
@@ -5600,6 +5616,18 @@ mod test {
         drop: impl Fn(u64) -> bool,
         rate: impl Fn(u64) -> f64,
     ) -> LinkRun {
+        run_link_with(config, buffer_bytes, drop, rate, |_, _| {})
+    }
+
+    /// [`run_link`], handing the controller to `each_ack` after every acknowledgement, with the
+    /// time in nanoseconds.
+    fn run_link_with(
+        config: Bbr3Config,
+        buffer_bytes: f64,
+        drop: impl Fn(u64) -> bool,
+        rate: impl Fn(u64) -> f64,
+        mut each_ack: impl FnMut(u64, &mut Bbr3),
+    ) -> LinkRun {
         const MSS: u64 = 1200;
         const RTT_NS: u64 = 20_000_000;
         const RUN_NS: u64 = 20_000_000_000;
@@ -5661,6 +5689,7 @@ mod test {
                 &rtt_est,
             );
             bbr.on_end_acks(at(now_ns), inflight, false, Some(number), SpaceKind::Data);
+            each_ack(now_ns, &mut bbr);
             if now_ns > RUN_NS / 2 {
                 late_delivered += MSS;
             }
@@ -5724,6 +5753,57 @@ mod test {
         assert!(
             small_delivered as f64 >= 0.95 * default_delivered as f64,
             "delivered {small_delivered} with gain 1.25, {default_delivered} with 2"
+        );
+    }
+
+    /// A smaller window gain set on a running controller shortens the standing queue as one
+    /// configured from the start does, and giving it back lets the queue return.
+    #[test]
+    fn a_window_gain_set_while_running_shortens_the_queue() {
+        const BW: f64 = 12_500_000.0;
+        let bursty = |ns: u64| {
+            if (ns / 10_000_000).is_multiple_of(2) {
+                BW * 1.4
+            } else {
+                BW * 0.6
+            }
+        };
+        let config = Bbr3Config {
+            probe_rng_seed: Some([9; 16]),
+            ..Bbr3Config::default()
+        };
+        let calm = 8_000_000_000..14_000_000_000;
+        let mut followed = true;
+        let run = run_link_with(
+            config,
+            BW * 0.02 * 4.0,
+            |_| false,
+            bursty,
+            |ns, bbr| {
+                if ns >= calm.start && ns < calm.end && bbr.probe_bw_cwnd_gain != 1.25 {
+                    followed &= Controller::set_window_gain(bbr, Some(1.25));
+                } else if ns >= calm.end && bbr.probe_bw_cwnd_gain != DEFAULT_CWND_GAIN {
+                    followed &= Controller::set_window_gain(bbr, None);
+                }
+            },
+        );
+        assert!(followed);
+        let p90 = |during: core::ops::Range<u64>| {
+            let mut rtts: Vec<u64> = run
+                .acks
+                .iter()
+                .filter(|(at, _)| during.contains(at))
+                .map(|&(_, rtt)| rtt)
+                .collect();
+            rtts.sort_unstable();
+            rtts[rtts.len() * 9 / 10] as f64 / 1e6
+        };
+        let before = p90(4_000_000_000..8_000_000_000);
+        let calmed = p90(10_000_000_000..14_000_000_000);
+        let after = p90(16_000_000_000..20_000_000_000);
+        assert!(
+            calmed + 8.0 < before && calmed + 8.0 < after,
+            "P90 RTT {before:.1} ms, then {calmed:.1} ms with gain 1.25, then {after:.1} ms"
         );
     }
 
