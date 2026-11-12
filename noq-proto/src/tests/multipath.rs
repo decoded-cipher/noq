@@ -2856,19 +2856,42 @@ fn acks_for_a_path_are_sent_on_that_path() -> TestResult {
 }
 
 #[test]
-fn acks_for_a_backup_path_go_on_another_path() -> TestResult {
+fn acks_for_a_backup_path_go_on_that_path() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = pair_with_two_paths()?;
+    let first = PathId::ZERO;
+    pair.conn_mut(Client)
+        .set_path_status(first, PathStatus::Backup)?;
+    pair.drive();
+    let first_before = path_acks_sent(&mut pair, Server, first);
+
+    send_on_path(&mut pair, first)?;
+
+    // Answered on another path, a probe of the backup path would time that path's
+    // way back, and a path that is back would look as slow.
+    assert!(path_acks_sent(&mut pair, Server, first) > first_before);
+    Ok(())
+}
+
+#[test]
+fn new_acks_of_a_backup_path_also_go_on_another_path() -> TestResult {
     let _guard = subscribe();
     let mut pair = pair_with_two_paths()?;
     let (first, second) = (PathId::ZERO, PathId(1));
     pair.conn_mut(Client)
         .set_path_status(first, PathStatus::Backup)?;
     pair.drive();
-    let first_before = path_acks_sent(&mut pair, Server, first);
     let second_before = path_acks_sent(&mut pair, Server, second);
 
+    // Data arrives on the backup path while the server is sending on the other, which
+    // is no faster: a backup path may be one for not delivering.
+    let down = pair.streams(Server).open(Dir::Uni).unwrap();
+    pair.send_stream(Server, down)
+        .set_affinity(StreamAffinity::Sticky(second))?;
+    pair.send_stream(Server, down).write(b"carries the ACKs")?;
+    pair.drive_client();
     send_on_path(&mut pair, first)?;
 
-    assert_eq!(path_acks_sent(&mut pair, Server, first), first_before);
     assert!(path_acks_sent(&mut pair, Server, second) > second_before);
     Ok(())
 }

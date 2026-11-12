@@ -1378,12 +1378,15 @@ impl Connection {
     }
 
     /// Whether this path carries its own ACKs, so a failing path cannot take other paths'
-    /// ACKs with it and each RTT is measured on its own path.
+    /// ACKs with it and each RTT is measured on its own path. A backup path does too:
+    /// answered elsewhere, a probe of it measures the other path's way back.
     fn carries_own_acks(&self, path_id: PathId) -> bool {
-        self.paths.contains_key(&path_id) && {
-            let info = self.scheduling_info(path_id);
-            info.can_send_data && info.status_allows_data
-        }
+        self.paths.contains_key(&path_id) && self.scheduling_info(path_id).can_send_data
+    }
+
+    /// Whether a path's data is kept off it, as a backup while another path is available.
+    fn kept_off(&self, path_id: PathId) -> bool {
+        self.paths.contains_key(&path_id) && !self.scheduling_info(path_id).status_allows_data
     }
 
     fn is_faster(&self, path_id: PathId, other: PathId) -> bool {
@@ -1680,8 +1683,15 @@ impl Connection {
                 } else {
                     // Connection-level frames only go on the best path for SpaceKind::Data
                     // frames. Unpinned data is already limited to the paths that may carry it.
+                    // A backup path still sends its own ACKs.
+                    let own_acks = can_send.acks
+                        && self.spaces[space_id]
+                            .number_spaces
+                            .get(&path_id)
+                            .is_some_and(|pns| pns.pending_acks.can_send());
                     scheduling_info.can_send_data
                         && (can_send.unpinned_data
+                            || own_acks
                             || (!can_send.is_empty() && scheduling_info.status_allows_data))
                 }
             };
@@ -6326,7 +6336,8 @@ impl Connection {
         let space_has_keys = self.crypto_state.has_keys(space_id.encryption_level());
         let is_0rtt = space_id == SpaceId::Data && !space_has_keys;
         // Also carry the ACKs of paths that cannot send their own, and new ACKs of slower
-        // paths, which arrive sooner here; those paths still send their own ACKs too.
+        // paths, which arrive sooner here; those paths still send their own ACKs too. So
+        // do a backup path's new ACKs, which may be backup for not delivering.
         let acks_for_other_paths = self.spaces[space_id]
             .number_spaces
             .iter()
@@ -6335,7 +6346,8 @@ impl Connection {
                 acked != path_id
                     && (pending.can_send() || pending.can_send_ahead())
                     && if self.carries_own_acks(acked) {
-                        pending.can_send_ahead() && self.is_faster(path_id, acked)
+                        pending.can_send_ahead()
+                            && (self.is_faster(path_id, acked) || self.kept_off(acked))
                     } else {
                         pending.can_send()
                     }
@@ -6379,20 +6391,18 @@ impl Connection {
             builder.write_frame(frame::ImmediateAck, stats);
         }
 
-        // ACK
-        if !scheduling_info.is_abandoned
-            && scheduling_info.can_send_data
-            && scheduling_info.status_allows_data
-        {
+        // ACK: a backup path carries only its own.
+        if !scheduling_info.is_abandoned && scheduling_info.can_send_data {
             let own_acks = space
                 .number_spaces
                 .get(&path_id)
                 .is_some_and(|pns| pns.pending_acks.can_send());
-            for acked in own_acks
-                .then_some(path_id)
-                .into_iter()
-                .chain(acks_for_other_paths)
-            {
+            let others = if scheduling_info.status_allows_data {
+                acks_for_other_paths
+            } else {
+                Vec::new()
+            };
+            for acked in own_acks.then_some(path_id).into_iter().chain(others) {
                 Self::populate_acks(
                     now,
                     self.receiving_ecn,
