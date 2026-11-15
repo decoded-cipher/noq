@@ -5240,8 +5240,23 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
+                    let id = frame.id;
                     if self.streams.received(frame, payload_len)?.should_transmit() {
                         self.spaces[SpaceId::Data].pending.max_data = true;
+                    }
+                    let rtt = || {
+                        let rtts = self.paths.values().map(|p| p.data.rtt.get());
+                        rtts.max().unwrap_or_default()
+                    };
+                    if self
+                        .streams
+                        .tune_receive_window(id, now, rtt)
+                        .should_transmit()
+                    {
+                        self.spaces[SpaceId::Data]
+                            .pending
+                            .max_stream_data
+                            .insert(id);
                     }
                 }
                 Frame::Ack(ack) => {

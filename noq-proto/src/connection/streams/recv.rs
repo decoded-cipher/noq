@@ -8,7 +8,7 @@ use super::state::get_or_insert_recv;
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
-use crate::{TransportError, VarInt, frame, hash_map::Entry};
+use crate::{Duration, Instant, TransportError, VarInt, frame, hash_map::Entry};
 
 #[derive(Debug, Default)]
 pub(super) struct Recv {
@@ -22,7 +22,30 @@ pub(super) struct Recv {
     ///
     /// Credit for data that is read is issued by [`Chunks::finalize`] instead.
     unread_credit: u64,
+    /// The most the application has been seen to read in two round trips
+    ///
+    /// The stream's window is this much, no less than [`MIN_WINDOW`] and no more than is
+    /// configured.
+    read_in_two_round_trips: u64,
+    /// The last measurement of the application's reading
+    reading: Option<Reading>,
 }
+
+/// A measurement of how much the application has read
+#[derive(Debug, Clone, Copy)]
+struct Reading {
+    /// When it was taken
+    at: Instant,
+    /// What the application had read by then
+    bytes_read: u64,
+    /// When the next may be taken: a round trip later, by the round trip last seen
+    next: Instant,
+}
+
+/// The window of a stream whose application has not been seen to read more than this in two
+/// round trips, where the configured window is larger: enough to carry 100 Mbit/s over a
+/// round trip of 100 ms
+const MIN_WINDOW: u64 = 1_250_000;
 
 impl Recv {
     pub(super) fn new(initial_max_data: u64) -> Box<Self> {
@@ -33,6 +56,8 @@ impl Recv {
             end: 0,
             stopped: false,
             unread_credit: 0,
+            read_in_two_round_trips: 0,
+            reading: None,
         })
     }
 
@@ -44,6 +69,50 @@ impl Recv {
         self.end = 0;
         self.stopped = false;
         self.unread_credit = 0;
+        self.read_in_two_round_trips = 0;
+        self.reading = None;
+    }
+
+    /// Notes how much the application has read since the last measurement, once that is at
+    /// least a round trip ago
+    ///
+    /// `rtt` gives the longest of the paths' round trips, since data and the credit that lets
+    /// more of it through may each take any path; it is asked for only when a measurement may
+    /// be due, about once a round trip. A peer that the window holds back delivers about a
+    /// window per round trip, so an application that reads it all doubles the window each
+    /// round trip until the window no longer holds the peer back.
+    pub(super) fn measure_reading(&mut self, now: Instant, rtt: impl FnOnce() -> Duration) {
+        let bytes_read = self.assembler.bytes_read();
+        let Some(last) = self.reading else {
+            self.reading = Some(Reading {
+                at: now,
+                bytes_read,
+                next: now,
+            });
+            return;
+        };
+        if now < last.next {
+            return;
+        }
+        let rtt = rtt();
+        let elapsed = now.saturating_duration_since(last.at);
+        if elapsed < rtt || elapsed.is_zero() {
+            self.reading = Some(Reading {
+                next: last.at + rtt,
+                ..last
+            });
+            return;
+        }
+        let read = u128::from(bytes_read - last.bytes_read);
+        let in_two_round_trips = (2 * read).saturating_mul(rtt.as_nanos()) / elapsed.as_nanos();
+        self.read_in_two_round_trips = self
+            .read_in_two_round_trips
+            .max(u64::try_from(in_two_round_trips).unwrap_or(u64::MAX));
+        self.reading = Some(Reading {
+            at: now,
+            bytes_read,
+            next: now + rtt,
+        });
     }
 
     /// Process a STREAM frame
@@ -117,17 +186,39 @@ impl Recv {
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
     pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
-        let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
+        // What the peer sends faster than the application reads is held here, and wasted
+        // should the stream then be dropped. So the window is sized as a TCP receiver sizes
+        // its buffer: to what the application reads in two round trips, which lets the peer
+        // double its rate without waiting on credit.
+        let window = self
+            .read_in_two_round_trips
+            .max(MIN_WINDOW)
+            .min(stream_receive_window);
+        let bytes_read = self.assembler.bytes_read();
+        // The window is room to hold what the application has yet to read. Once it has read
+        // up to a gap, what is held past the gap waits on a retransmission or a slower path,
+        // not on the application, so the window starts where the held data ends: however
+        // long the gap takes to fill, the other paths go on delivering, as far as the
+        // configured window allows.
+        let start = if self.assembler.read_to_gap() {
+            self.end
+        } else {
+            bytes_read
+        };
+        // A stream starts with the configured window as its credit, which is never taken back.
+        let max_stream_data = (start + window)
+            .min(bytes_read + stream_receive_window)
+            .max(self.sent_max_stream_data);
 
         // Only announce a window update if it's significant enough
         // to make it worthwhile sending a MAX_STREAM_DATA frame.
-        // We use here a fraction of the configured stream receive window to make
+        // We use here a fraction of the stream's receive window to make
         // the decision, and accommodate for streams using bigger windows requiring
         // less updates. A fixed size would also work - but it would need to be
-        // smaller than `stream_receive_window` in order to make sure the stream
+        // smaller than the window in order to make sure the stream
         // does not get stuck.
         let diff = max_stream_data - self.sent_max_stream_data;
-        let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
+        let transmit = self.can_send_flow_control() && diff >= (window / 8);
         (max_stream_data, ShouldTransmit(transmit))
     }
 
@@ -476,6 +567,124 @@ mod tests {
     use crate::{Dir, Side};
 
     use super::*;
+
+    /// Receives `len` bytes at `offset`
+    fn receive(s: &mut Recv, offset: u64, len: u64) {
+        s.ingest(
+            frame::Stream {
+                id: StreamId::new(Side::Client, Dir::Uni, 0),
+                offset,
+                fin: false,
+                data: bytes::BytesMut::zeroed(len as usize).freeze(),
+            },
+            len as usize,
+            0,
+            u64::MAX,
+        )
+        .unwrap();
+    }
+
+    /// Reads all there is before the first gap
+    fn read(s: &mut Recv) {
+        while s.assembler.read(usize::MAX, true).is_some() {}
+    }
+
+    #[test]
+    fn window_follows_what_the_application_reads_in_two_round_trips() {
+        const CONFIGURED: u64 = 16 * MIN_WINDOW;
+        let rtt = Duration::from_millis(10);
+        let start = Instant::now();
+        let mut s = Recv::new(CONFIGURED);
+        s.measure_reading(start, || rtt);
+
+        // Reading less than the smallest window leaves the stream with that window, which
+        // reaches no further than the credit the stream began with.
+        receive(&mut s, 0, MIN_WINDOW / 4);
+        read(&mut s);
+        s.measure_reading(start + rtt, || rtt);
+        assert_eq!(s.read_in_two_round_trips, MIN_WINDOW / 2);
+        assert_eq!(s.max_stream_data(CONFIGURED).0, CONFIGURED);
+
+        // Half a round trip is too short to measure over.
+        receive(&mut s, MIN_WINDOW / 4, 4 * MIN_WINDOW);
+        read(&mut s);
+        s.measure_reading(start + rtt + rtt / 2, || rtt);
+        assert_eq!(s.read_in_two_round_trips, MIN_WINDOW / 2);
+
+        // Four windows read in two round trips make the window four times the smallest.
+        s.measure_reading(start + 3 * rtt, || rtt);
+        assert_eq!(s.read_in_two_round_trips, 4 * MIN_WINDOW);
+        let end = s.end;
+        receive(&mut s, end, 15 * MIN_WINDOW - end);
+        read(&mut s);
+        let (max_stream_data, transmit) = s.max_stream_data(CONFIGURED);
+        assert_eq!(max_stream_data, 19 * MIN_WINDOW);
+        assert!(transmit.should_transmit());
+    }
+
+    #[test]
+    fn a_configured_window_below_the_smallest_is_announced_as_often_as_before() {
+        const CONFIGURED: u64 = MIN_WINDOW / 2;
+        let mut s = Recv::new(CONFIGURED);
+        receive(&mut s, 0, MIN_WINDOW / 10);
+        read(&mut s);
+        let (max_stream_data, transmit) = s.max_stream_data(CONFIGURED);
+        assert_eq!(max_stream_data, MIN_WINDOW / 10 + CONFIGURED);
+        assert!(
+            transmit.should_transmit(),
+            "an eighth of the configured window has been read"
+        );
+    }
+
+    #[test]
+    fn data_held_past_a_gap_does_not_use_up_the_window() {
+        const CONFIGURED: u64 = 16 * MIN_WINDOW;
+        const GAP: u64 = 14 * MIN_WINDOW;
+        let mut s = Recv::new(CONFIGURED);
+
+        // The peer uses all its initial credit, but for one byte that goes missing.
+        receive(&mut s, 0, GAP);
+        receive(&mut s, GAP + 1, CONFIGURED - GAP - 1);
+        assert_eq!(
+            s.max_stream_data(CONFIGURED).0,
+            CONFIGURED,
+            "an application that has yet to read gets no credit for what it has not read"
+        );
+
+        // Once the application has read up to the gap, the peer may go on sending past
+        // what is held, a window at a time, until that fills the configured window.
+        read(&mut s);
+        assert_eq!(s.max_stream_data(CONFIGURED).0, CONFIGURED + MIN_WINDOW);
+        while s.end < GAP + CONFIGURED {
+            let (max_stream_data, _) = s.max_stream_data(CONFIGURED);
+            s.record_sent_max_stream_data(max_stream_data);
+            let end = s.end;
+            receive(&mut s, end, max_stream_data - end);
+        }
+        assert_eq!(s.max_stream_data(CONFIGURED).0, GAP + CONFIGURED);
+    }
+
+    #[test]
+    fn a_filled_gap_gives_the_window_back_to_the_reader() {
+        const CONFIGURED: u64 = 16 * MIN_WINDOW;
+        let mut s = Recv::new(CONFIGURED);
+        receive(&mut s, 0, CONFIGURED);
+        read(&mut s);
+        let (max_stream_data, _) = s.max_stream_data(CONFIGURED);
+        s.record_sent_max_stream_data(max_stream_data);
+
+        // One byte goes missing, and what arrives past it moves the window on.
+        receive(&mut s, CONFIGURED + 1, MIN_WINDOW - 1);
+        read(&mut s);
+        assert_eq!(s.max_stream_data(CONFIGURED).0, CONFIGURED + 2 * MIN_WINDOW);
+
+        // Once the byte arrives, what was held is the application's to read, and the window
+        // starts where its reading is again.
+        receive(&mut s, CONFIGURED, 1);
+        assert_eq!(s.max_stream_data(CONFIGURED).0, CONFIGURED + MIN_WINDOW);
+        read(&mut s);
+        assert_eq!(s.max_stream_data(CONFIGURED).0, CONFIGURED + 2 * MIN_WINDOW);
+    }
 
     #[test]
     fn reordered_frames_while_stopped() {

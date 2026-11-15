@@ -8,7 +8,8 @@ use super::{
     StreamHalf,
 };
 use crate::{
-    Dir, FxHashMap, MAX_STREAM_COUNT, PathId, Side, StreamId, TransportError, VarInt,
+    Dir, Duration, FxHashMap, Instant, MAX_STREAM_COUNT, PathId, Side, StreamId, TransportError,
+    VarInt,
     connection::{PacketBuilder, paths::PathIdKey, stats::FrameStats},
     frame::{self, FrameStruct},
     hash_map,
@@ -297,6 +298,29 @@ impl StreamsState {
         }
 
         Ok(self.add_read_credits(credit))
+    }
+
+    /// Sizes the receive window of a stream that has just received data to what its
+    /// application reads, given the longest of the paths' round trips
+    ///
+    /// The result is whether a `MAX_STREAM_DATA` frame needs to be transmitted: past a gap
+    /// the window moves with what arrives, without the application reading anything.
+    pub(crate) fn tune_receive_window(
+        &mut self,
+        id: StreamId,
+        now: Instant,
+        rtt: impl FnOnce() -> Duration,
+    ) -> ShouldTransmit {
+        let Some(rs) = self
+            .recv
+            .get_mut(&id)
+            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_open_recv_mut())
+        else {
+            return ShouldTransmit(false);
+        };
+        rs.measure_reading(now, rtt);
+        rs.max_stream_data(self.stream_receive_window).1
     }
 
     /// Process incoming RESET_STREAM frame

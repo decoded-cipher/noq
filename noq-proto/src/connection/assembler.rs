@@ -295,6 +295,15 @@ impl Assembler {
         self.bytes_read
     }
 
+    /// Whether ordered reads have taken all there is before the first gap in the stream
+    pub(super) fn read_to_gap(&self) -> bool {
+        self.state.is_ordered()
+            && self
+                .data
+                .front()
+                .is_none_or(|chunk| chunk.offset > self.bytes_read)
+    }
+
     /// Discard all buffered data
     pub(super) fn clear(&mut self) {
         self.data.clear();
