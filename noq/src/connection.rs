@@ -1,8 +1,8 @@
 use std::{
     any::Any,
     fmt,
-    future::Future,
-    io,
+    future::{Future, poll_fn},
+    io, mem,
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
@@ -1665,10 +1665,22 @@ pub(crate) struct State {
     /// from both maps.
     pub(crate) final_path_stats: FxHashMap<PathId, PathStats>,
     pub(crate) path_events: tokio::sync::broadcast::Sender<PathEvent>,
-    sender: Pin<Box<dyn UdpSender>>,
+    /// Shared with the send task, which holds it for the length of a send, and only while the
+    /// driver waits for that send or builds the transmit after it
+    sender: Arc<Mutex<Pin<Box<dyn UdpSender>>>>,
+    /// The sender's `max_transmit_segments`, as of the last send
+    ///
+    /// Kept here so that the driver does not wait for the sender while the send task is
+    /// inside a send.
+    max_segments: NonZeroUsize,
+    /// A running average of how long the sends of several datagrams at once have taken
+    send_time: Duration,
+    /// Present once such sends have taken [`SLOW_SEND`] on average
+    outbox: Option<Outbox>,
     pub(crate) runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
-    /// We buffer a transmit when the underlying I/O would block
+    /// A transmit built in `send_buffer` that waits for the socket, or for the send task to
+    /// have sent the one before it
     buffered_transmit: Option<proto::Transmit>,
     /// Our last external address reported by the peer. When multipath is enabled, this will be the
     /// last report across all paths.
@@ -1706,7 +1718,10 @@ impl State {
             stopped: FxHashMap::default(),
             open_path: FxHashMap::default(),
             error: None,
-            sender,
+            max_segments: sender.max_transmit_segments(),
+            sender: Arc::new(Mutex::new(sender)),
+            send_time: Duration::ZERO,
+            outbox: None,
             runtime,
             send_buffer: Vec::new(),
             buffered_transmit: None,
@@ -1723,10 +1738,7 @@ impl State {
         let now = self.runtime.now();
         let mut transmits = 0;
 
-        let max_datagrams = self
-            .sender
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
+        let max_datagrams = self.max_segments.min(MAX_TRANSMIT_SEGMENTS);
 
         loop {
             // Retry the last transmit, or get a new one.
@@ -1750,11 +1762,40 @@ impl State {
                 }
             };
 
-            let len = t.size;
-            match self
-                .sender
+            // A transmit goes out after the one before it, which the send task may still hold.
+            if let Some(outbox) = &mut self.outbox {
+                match outbox.poll_idle(cx) {
+                    Poll::Pending => {
+                        self.buffered_transmit = Some(t);
+                        return Ok(false);
+                    }
+                    Poll::Ready(Err(e)) => return Err(e),
+                    Poll::Ready(Ok(None)) => {}
+                    Poll::Ready(Ok(Some((took, max_segments)))) => {
+                        self.max_segments = max_segments;
+                        self.note_send_time(took);
+                    }
+                }
+            }
+
+            // Single datagrams, such as acknowledgements and keep-alives, are neither timed nor
+            // handed over: an idle connection never wakes the send task.
+            let several = t.segment_size.is_some_and(|size| t.size > size);
+            if several && self.send_time >= SLOW_SEND {
+                self.outbox
+                    .get_or_insert_with(|| Outbox::new(self.sender.clone(), self.runtime.clone()))
+                    .hand_over(t, &mut self.send_buffer);
+                // Ending the poll lets the send task, woken on this thread, start the send at
+                // once. Asking to be polled again lets another thread take the driver
+                // meanwhile, to build the next transmit beside the send.
+                return Ok(true);
+            }
+
+            let started = several.then(|| self.runtime.now());
+            let mut sender = self.sender.lock("send");
+            match sender
                 .as_mut()
-                .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
+                .poll_send(&udp_transmit(&t, &self.send_buffer[..t.size]), cx)
             {
                 Poll::Pending => {
                     self.buffered_transmit = Some(t);
@@ -1762,6 +1803,11 @@ impl State {
                 }
                 Poll::Ready(Err(e)) => return Err(e),
                 Poll::Ready(Ok(())) => {}
+            }
+            self.max_segments = sender.max_transmit_segments();
+            drop(sender);
+            if let Some(started) = started {
+                self.note_send_time(self.runtime.now().saturating_duration_since(started));
             }
 
             if transmits >= MAX_TRANSMIT_DATAGRAMS {
@@ -1774,6 +1820,11 @@ impl State {
         }
 
         Ok(false)
+    }
+
+    /// Folds the time a send of several datagrams took into the average of such sends
+    fn note_send_time(&mut self, took: Duration) {
+        self.send_time = (7 * self.send_time + took) / 8;
     }
 
     fn forward_endpoint_events(&mut self) {
@@ -1792,7 +1843,10 @@ impl State {
         loop {
             match self.conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(sender))) => {
-                    self.sender = sender;
+                    // The send task ends with the old sender, once it has sent what it holds.
+                    self.outbox = None;
+                    self.max_segments = sender.max_transmit_segments();
+                    self.sender = Arc::new(Mutex::new(sender));
                     self.inner.handle_network_change(None, self.runtime.now());
                 }
                 Poll::Ready(Some(ConnectionEvent::LocalAddressChanged(hint))) => {
@@ -2127,6 +2181,120 @@ pub enum SendDatagramError {
     #[error("path closed")]
     PathClosed,
 }
+
+/// The connection driver's end of the hand-over to the task that sends beside it
+///
+/// A send is a system call and, within it, as much of the network stack as the kernel runs
+/// before it returns. Where that takes about as long as building and encrypting the
+/// datagrams, the driver's thread is what limits the connection, so the driver hands each
+/// transmit of several datagrams to this task and builds the next transmit while the task is
+/// inside the send.
+///
+/// The task holds one transmit at a time, and the driver builds only the one that follows
+/// it, which waits in `buffered_transmit` as a transmit does when the socket is not
+/// writable. Nothing queues beyond that, and every transmit, handed over or not, goes out
+/// after the one before it, but across a rebind: the task may still be sending its last
+/// on the old socket while the driver sends on the new one.
+struct Outbox {
+    /// Transmits for the send task, each with the buffer it was built in
+    transmits: mpsc::UnboundedSender<(proto::Transmit, Vec<u8>)>,
+    /// What the task has sent, or the error its send ended on
+    sent: mpsc::UnboundedReceiver<io::Result<Sent>>,
+    /// Whether the task holds a transmit
+    busy: bool,
+    /// The buffer to build in while the task sends from the other
+    spare: Vec<u8>,
+}
+
+/// A transmit the send task has sent
+struct Sent {
+    /// The buffer the transmit was built in
+    buffer: Vec<u8>,
+    /// How long the send took, from the socket being writable
+    took: Duration,
+    /// The sender's `max_transmit_segments` after the send
+    max_segments: NonZeroUsize,
+}
+
+impl Outbox {
+    fn new(sender: Arc<Mutex<Pin<Box<dyn UdpSender>>>>, runtime: Arc<dyn Runtime>) -> Self {
+        let (transmits, handed_over) = mpsc::unbounded_channel();
+        let (returned, sent) = mpsc::unbounded_channel();
+        let task = send_transmits(sender, runtime.clone(), handed_over, returned);
+        runtime.spawn(Box::pin(task));
+        Self {
+            transmits,
+            sent,
+            busy: false,
+            spare: Vec::new(),
+        }
+    }
+
+    /// Waits until the task has sent the transmit it was handed, if any, and tells how long
+    /// that took and the sender's `max_transmit_segments` after it
+    fn poll_idle(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<(Duration, NonZeroUsize)>>> {
+        if !self.busy {
+            return Poll::Ready(Ok(None));
+        }
+        let Some(sent) = ready!(self.sent.poll_recv(cx)) else {
+            return Poll::Ready(Err(io::Error::other("send task ended")));
+        };
+        let sent = sent?;
+        self.busy = false;
+        self.spare = sent.buffer;
+        Poll::Ready(Ok(Some((sent.took, sent.max_segments))))
+    }
+
+    /// Hands `transmit`, built in `buffer`, to the idle task and leaves `buffer` free to
+    /// build the next one in
+    fn hand_over(&mut self, transmit: proto::Transmit, buffer: &mut Vec<u8>) {
+        let built = mem::replace(buffer, mem::take(&mut self.spare));
+        self.busy = true;
+        // Fails only once the task is gone, which the next `poll_idle` reports.
+        let _ = self.transmits.send((transmit, built));
+    }
+}
+
+/// Sends each transmit it is handed and hands its buffer back, until the hand-over is dropped
+async fn send_transmits(
+    sender: Arc<Mutex<Pin<Box<dyn UdpSender>>>>,
+    runtime: Arc<dyn Runtime>,
+    mut handed_over: mpsc::UnboundedReceiver<(proto::Transmit, Vec<u8>)>,
+    returned: mpsc::UnboundedSender<io::Result<Sent>>,
+) {
+    while let Some((transmit, buffer)) = handed_over.recv().await {
+        let contents = &buffer[..transmit.size];
+        let sending = poll_fn(|cx| {
+            let started = runtime.now();
+            let mut sender = sender.lock("send");
+            let sending = sender
+                .as_mut()
+                .poll_send(&udp_transmit(&transmit, contents), cx);
+            ready!(sending)?;
+            let took = runtime.now().saturating_duration_since(started);
+            Poll::Ready(Ok((took, sender.max_transmit_segments())))
+        });
+        let sent = sending.await.map(|(took, max_segments)| Sent {
+            buffer,
+            took,
+            max_segments,
+        });
+        // Nobody takes the buffer once the hand-over is dropped, as it is on a rebind.
+        let _ = returned.send(sent);
+    }
+}
+
+/// How long the sends of several datagrams at once take on average where the driver hands
+/// them to a send task
+///
+/// A hand-over costs a wake of the task and of a thread to run the driver beside it, so it
+/// pays only where sending is a large part of the driver's work, as on a small machine whose
+/// kernel takes over ten microseconds per datagram. A machine that takes a few microseconds
+/// per datagram stays well under this, an occasional send held up by the kernel included.
+pub(crate) const SLOW_SEND: Duration = Duration::from_micros(80);
 
 /// The maximum amount of datagrams which will be produced in a single `drive_transmit` call
 ///

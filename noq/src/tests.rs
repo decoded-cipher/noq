@@ -8,20 +8,23 @@ use testresult::TestResult;
 use tokio_stream::StreamExt;
 
 use std::{
+    collections::HashSet,
     convert::TryInto,
     future::Future,
-    io,
+    io, mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    num::NonZeroUsize,
     pin::{Pin, pin},
     str,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker, ready},
 };
 
-use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime};
+use crate::connection::SLOW_SEND;
+use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime, UdpSender};
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{
@@ -2179,4 +2182,159 @@ impl crate::runtime::Runtime for PanicPropagatingRuntime {
     fn now(&self) -> Instant {
         TokioRuntime.now()
     }
+}
+
+/// A [`Runtime`] whose sockets take long to send several datagrams at once, as the kernel of a
+/// small machine does
+///
+/// [`Runtime`]: crate::runtime::Runtime
+#[derive(Debug)]
+struct SlowSendRuntime {
+    /// The tasks that have sent several datagrams at once
+    batch_senders: Arc<Mutex<HashSet<tokio::task::Id>>>,
+}
+
+impl crate::runtime::Runtime for SlowSendRuntime {
+    fn new_timer(&self, t: Instant) -> Pin<Box<dyn AsyncTimer>> {
+        TokioRuntime.new_timer(t)
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        TokioRuntime.spawn(future);
+    }
+
+    fn wrap_udp_socket(&self, sock: UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
+        Ok(Box::new(SlowSendSocket {
+            inner: TokioRuntime.wrap_udp_socket(sock)?,
+            batch_senders: self.batch_senders.clone(),
+        }))
+    }
+
+    fn now(&self) -> Instant {
+        TokioRuntime.now()
+    }
+}
+
+#[derive(Debug)]
+struct SlowSendSocket {
+    inner: Box<dyn AsyncUdpSocket>,
+    batch_senders: Arc<Mutex<HashSet<tokio::task::Id>>>,
+}
+
+impl AsyncUdpSocket for SlowSendSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(SlowSender {
+            inner: self.inner.create_sender(),
+            sent: 0,
+            batch_senders: self.batch_senders.clone(),
+        })
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_receive_segments(&self) -> NonZeroUsize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
+#[derive(Debug)]
+struct SlowSender {
+    inner: Pin<Box<dyn UdpSender>>,
+    /// How many datagrams of the transmit in hand have gone out
+    sent: usize,
+    batch_senders: Arc<Mutex<HashSet<tokio::task::Id>>>,
+}
+
+impl UdpSender for SlowSender {
+    /// Sends the datagrams of `transmit` one by one, so that the socket need not support
+    /// segmentation, and takes twice [`SLOW_SEND`] more over several of them
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &udp::Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let size = transmit.segment_size.unwrap_or(transmit.contents.len());
+        for datagram in transmit.contents.chunks(size.max(1)).skip(self.sent) {
+            let single = udp::Transmit {
+                contents: datagram,
+                segment_size: None,
+                ..*transmit
+            };
+            ready!(self.inner.as_mut().poll_send(&single, cx))?;
+            self.sent += 1;
+        }
+        if mem::take(&mut self.sent) > 1 {
+            std::thread::sleep(2 * SLOW_SEND);
+            self.batch_senders.lock().unwrap().insert(tokio::task::id());
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::new(10).unwrap()
+    }
+}
+
+/// Where sends of several datagrams are slow, the driver hands them to the send task, and to
+/// a new one after a rebind, and the stream arrives whole
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_sends_go_out_through_the_send_task() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let batch_senders = Arc::new(Mutex::new(HashSet::new()));
+    let runtime = Arc::new(SlowSendRuntime {
+        batch_senders: batch_senders.clone(),
+    });
+    let client = factory.endpoint_with_runtime("client", TransportConfig::default(), runtime);
+    let server = factory.endpoint("server");
+    let server_addr = server.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let mut stream = conn.accept_uni().await.unwrap();
+        stream.read_to_end(usize::MAX).await.unwrap()
+    });
+
+    let msg = gen_data(4 * 1024 * 1024, 0x5eed);
+    let conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut stream = conn.open_uni().await.unwrap();
+    stream.write_all(&msg).await.unwrap();
+    stream.finish().unwrap();
+
+    // The driver sends until its sends have proved slow, the send task from then on.
+    let handed_over = async {
+        while batch_senders.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), handed_over)
+        .await
+        .expect("no send was handed over");
+    // The rest of the stream goes out through the new socket, by a send task of its own.
+    client
+        .rebind(UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap())
+        .unwrap();
+
+    let received = server_task.await.unwrap();
+    assert!(received == msg, "the stream arrives as it was written");
+    assert_eq!(batch_senders.lock().unwrap().len(), 3);
 }
