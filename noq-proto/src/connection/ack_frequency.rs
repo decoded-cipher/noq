@@ -1,3 +1,5 @@
+use core::mem;
+
 use crate::Duration;
 use crate::frame::AckFrequency;
 use crate::transport_parameters::TransportParameters;
@@ -13,12 +15,18 @@ pub(super) struct AckFrequencyState {
     in_flight_ack_frequency_frame: Option<(PathId, u64, Duration)>,
     next_outgoing_sequence_number: VarInt,
     pub(super) peer_max_ack_delay: Duration,
+    /// The threshold and `max_ack_delay` last requested, for every path's congestion controller
+    requested: Option<(u64, Duration)>,
+    /// Whether paths other than the one that carried `requested` have yet to learn of it
+    requested_unshared: bool,
 
     //
     // Receiving ACK_FREQUENCY frames
     /// The sequence number of the most recently received ACK_FREQUENCY frame
     last_ack_frequency_frame: Option<u64>,
     pub(super) max_ack_delay: Duration,
+    /// The most recent ACK_FREQUENCY frame received, for paths opened after it
+    pub(super) received: Option<AckFrequency>,
 }
 
 impl AckFrequencyState {
@@ -27,9 +35,12 @@ impl AckFrequencyState {
             in_flight_ack_frequency_frame: None,
             next_outgoing_sequence_number: VarInt(0),
             peer_max_ack_delay: default_max_ack_delay,
+            requested: None,
+            requested_unshared: false,
 
             last_ack_frequency_frame: None,
             max_ack_delay: default_max_ack_delay,
+            received: None,
         }
     }
 
@@ -97,9 +108,24 @@ impl AckFrequencyState {
         &mut self,
         path_id: PathId,
         pn: u64,
+        ack_eliciting_threshold: u64,
         requested_max_ack_delay: Duration,
     ) {
         self.in_flight_ack_frequency_frame = Some((path_id, pn, requested_max_ack_delay));
+        self.requested = Some((ack_eliciting_threshold, requested_max_ack_delay));
+        self.requested_unshared = true;
+    }
+
+    /// The threshold and `max_ack_delay` last requested of the peer, if any
+    pub(super) fn requested(&self) -> Option<(u64, Duration)> {
+        self.requested
+    }
+
+    /// The request just sent, once, for the paths that did not carry it
+    pub(super) fn take_unshared_request(&mut self) -> Option<(u64, Duration)> {
+        mem::take(&mut self.requested_unshared)
+            .then_some(self.requested)
+            .flatten()
     }
 
     /// Notifies the [`AckFrequencyState`] that a packet has been ACKed
@@ -141,6 +167,7 @@ impl AckFrequencyState {
             ));
         }
         self.max_ack_delay = max_ack_delay;
+        self.received = Some(*frame);
 
         Ok(true)
     }

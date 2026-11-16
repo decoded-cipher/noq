@@ -1069,6 +1069,10 @@ impl Connection {
         if let Some(initial_rtt) = initial_rtt {
             data.rtt.reset_initial_rtt(initial_rtt);
         }
+        if let Some((threshold, max_ack_delay)) = self.ack_frequency.requested() {
+            data.congestion
+                .on_ack_frequency_update(threshold, max_ack_delay);
+        }
 
         // To open a path locally we need to send a packet on the path. Sending a challenge
         // guarantees this.
@@ -1083,6 +1087,9 @@ impl Connection {
         let mut pn_space = spaces::PacketNumberSpace::new(now, SpaceId::Data, &mut self.rng);
         if let Some(pn) = pn {
             pn_space.dedup.insert(pn);
+        }
+        if let Some(frame) = &self.ack_frequency.received {
+            pn_space.pending_acks.set_ack_frequency_params(frame);
         }
         self.spaces[SpaceId::Data]
             .number_spaces
@@ -1915,6 +1922,15 @@ impl Connection {
             }
 
             self.populate_packet(now, space_id, path_id, scheduling_info, &mut builder);
+            if let Some((threshold, max_ack_delay)) = self.ack_frequency.take_unshared_request() {
+                for (&id, path) in self.paths.iter_mut() {
+                    if id != path_id {
+                        path.data
+                            .congestion
+                            .on_ack_frequency_update(threshold, max_ack_delay);
+                    }
+                }
+            }
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -6047,14 +6063,19 @@ impl Connection {
             let peer_max_udp_payload_size =
                 u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
                     .unwrap_or(u16::MAX);
-            PathData::new(
+            let mut data = PathData::new(
                 (network_path, path_id),
                 self.allow_mtud,
                 Some(peer_max_udp_payload_size),
                 self.path_generation_counter,
                 now,
                 &self.config,
-            )
+            );
+            if let Some((threshold, max_ack_delay)) = self.ack_frequency.requested() {
+                data.congestion
+                    .on_ack_frequency_update(threshold, max_ack_delay);
+            }
+            data
         };
         new_path_data.last_observed_addr_report = path.data.last_observed_addr_report.clone();
         if let Some(report) = observed_addr
@@ -6472,8 +6493,12 @@ impl Connection {
             };
             builder.write_frame(frame, stats);
 
-            self.ack_frequency
-                .ack_frequency_sent(path_id, builder.packet_number, max_ack_delay);
+            self.ack_frequency.ack_frequency_sent(
+                path_id,
+                builder.packet_number,
+                config.ack_eliciting_threshold.into_inner(),
+                max_ack_delay,
+            );
             path.congestion.on_ack_frequency_update(
                 config.ack_eliciting_threshold.into_inner(),
                 max_ack_delay,

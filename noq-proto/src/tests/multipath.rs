@@ -15,10 +15,10 @@ use tracing::info;
 
 use crate::connection::timer::{PathTimer, Timer};
 use crate::{
-    ClientConfig, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, FourTuple,
-    Instant, LOCAL_CID_COUNT, NetworkChangeHint, PathChoice, PathError, PathId, PathScheduler,
-    PathSchedulerFactory, PathSnapshot, PathStats, PathStatus, RandomConnectionIdGenerator,
-    ServerConfig,
+    AckFrequencyConfig, ClientConfig, ConnectionId, ConnectionIdGenerator, Endpoint,
+    EndpointConfig, FourTuple, Instant, LOCAL_CID_COUNT, NetworkChangeHint, PathChoice, PathError,
+    PathId, PathScheduler, PathSchedulerFactory, PathSnapshot, PathStats, PathStatus,
+    RandomConnectionIdGenerator, ServerConfig,
     Side::{self, *},
     TransportConfig,
     cid_queue::CidQueue,
@@ -3272,6 +3272,32 @@ fn each_run_of_lost_packets_is_one_loss_event() -> TestResult {
     }
     let stats = pair.path_stats(Client, PathId::ZERO).unwrap();
     assert_eq!((stats.lost_packets, stats.loss_events), (5, 2));
+    Ok(())
+}
+
+#[test]
+fn a_path_opened_later_follows_the_requested_ack_frequency() -> TestResult {
+    let _guard = subscribe();
+    let mut ack_frequency = AckFrequencyConfig::default();
+    ack_frequency.ack_eliciting_threshold(9u32.into());
+    let mut transport = TransportConfig::default();
+    transport.ack_frequency_config(Some(ack_frequency));
+    let mut pair = pair_with_two_paths_and(transport)?;
+    let acks = |pair: &mut ConnPair| {
+        path_acks_sent(pair, Server, PathId::ZERO) + path_acks_sent(pair, Server, PathId(1))
+    };
+    let before = acks(&mut pair);
+    for _ in 0..3 {
+        pair.datagrams(Client)
+            .send_on_path(PathId(1), Bytes::from_static(&[0; 1000]), false)?;
+    }
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(
+        acks(&mut pair),
+        before,
+        "three packets were acknowledged at once"
+    );
     Ok(())
 }
 
