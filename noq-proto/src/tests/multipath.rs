@@ -3253,6 +3253,29 @@ fn copies_still_queued_are_cancelled_once_one_is_acknowledged() -> TestResult {
 }
 
 #[test]
+fn each_run_of_lost_packets_is_one_loss_event() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = pair_with_two_paths()?;
+    let datagram = Bytes::from_static(&[0; 1000]);
+    for lost in [3, 2] {
+        for _ in 0..lost {
+            pair.datagrams(Client)
+                .send_on_path(PathId::ZERO, datagram.clone(), false)?;
+        }
+        pair.drive_client();
+        pair.server.inbound.clear();
+        for _ in 0..4 {
+            pair.datagrams(Client)
+                .send_on_path(PathId::ZERO, datagram.clone(), false)?;
+        }
+        pair.drive();
+    }
+    let stats = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!((stats.lost_packets, stats.loss_events), (5, 2));
+    Ok(())
+}
+
+#[test]
 fn datagrams_bound_to_a_closed_path_are_dropped() -> TestResult {
     let _guard = subscribe();
     let mut pair = pair_with_two_paths()?;

@@ -3699,9 +3699,21 @@ impl Connection {
                 .get(largest_lost)
                 .unwrap()
                 .time_sent;
+            // A run of losses goes on across one packet number: those are skipped at
+            // random, and packets of ACKs alone are not tracked.
+            let mut loss_events = 0;
+            if pn_space == SpaceId::Data {
+                let path = self.path_data_mut(path_id);
+                for &packet in &lost_packets {
+                    let goes_on = path.last_lost.is_some_and(|last| packet <= last + 2);
+                    loss_events += u64::from(!goes_on);
+                    path.last_lost = Some(packet);
+                }
+            }
             let path_stats = self.path_stats.get_mut(path_id);
             path_stats.lost_packets += lost_packets.len() as u64;
             path_stats.lost_bytes += size_of_lost_packets;
+            path_stats.loss_events += loss_events;
             trace!(
                 %path_id,
                 count = lost_packets.len(),

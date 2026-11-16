@@ -263,6 +263,8 @@ pub(super) struct PathData {
     /// Declared lost with nothing acknowledged since; its losses then signal neither
     /// congestion nor a smaller path MTU.
     pub(super) outage: bool,
+    /// The last packet number declared lost, to count runs of losses
+    pub(super) last_lost: Option<u64>,
 
     //
     // Per-path idle & keep alive
@@ -369,6 +371,7 @@ impl PathData {
             first_packet: None,
             pto_count: 0,
             outage: false,
+            last_lost: None,
             idle_timeout: config.default_path_max_idle_timeout,
             keep_alive: config.default_path_keep_alive_interval,
             permit_idle_reset: true,
@@ -419,6 +422,7 @@ impl PathData {
             first_packet: None,
             pto_count: 0,
             outage: false,
+            last_lost: prev.last_lost,
             idle_timeout: prev.idle_timeout,
             keep_alive: prev.keep_alive,
             permit_idle_reset: true,

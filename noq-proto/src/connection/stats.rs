@@ -279,6 +279,11 @@ pub struct PathStats {
     ///
     /// This does not count bytes for ACK-only (non-ack-eliciting, non-padded) packets.
     pub lost_bytes: u64,
+    /// The number of runs of application data packets lost on this path, one after another
+    /// but for a single packet number between two of them.
+    ///
+    /// [`Self::lost_packets`] over this is the length of a burst of loss, on average.
+    pub loss_events: u64,
     /// The number of PLPMTUD probe packets sent on this path.
     ///
     /// These are also counted by [`Self::sent_packets`] and [`Self::sent_bytes`].
@@ -370,6 +375,7 @@ impl core::ops::Add<PathStats> for ConnectionStats {
             sent_plpmtud_probes: _,
             lost_plpmtud_probes: _,
             black_holes_detected: _,
+            loss_events: _,
             cancelled_copies: _,
             cancelled_copy_bytes: _,
             current_mtu: _,
@@ -418,6 +424,7 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
             sent_plpmtud_probes: _,
             lost_plpmtud_probes: _,
             black_holes_detected: _,
+            loss_events: _,
             cancelled_copies: _,
             cancelled_copy_bytes: _,
             current_mtu: _,
