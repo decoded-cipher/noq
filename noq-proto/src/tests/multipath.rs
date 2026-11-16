@@ -1,7 +1,11 @@
 //! Tests for multipath
 
 use alloc::{boxed::Box, format, sync::Arc, vec, vec::Vec};
-use core::{net::SocketAddr, num::NonZeroU32, time::Duration};
+use core::{
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 use std::dbg;
 
 use assert_matches::assert_matches;
@@ -3212,6 +3216,39 @@ fn each_path_has_its_own_datagram_send_buffer() -> TestResult {
         .send_on_path(second, datagram.clone(), false)?;
     pair.datagrams(Client).send(datagram, false)?;
     assert_eq!(pair.datagrams(Client).queued_on_path(second), 1000);
+    Ok(())
+}
+
+#[test]
+fn copies_still_queued_are_cancelled_once_one_is_acknowledged() -> TestResult {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.datagram_send_buffer_size(200_000);
+    let mut pair = pair_with_two_paths_and(transport)?;
+    let (first, second) = (PathId::ZERO, PathId(1));
+    // The second path's copies wait behind more bulk than its window sends at once.
+    for _ in 0..60 {
+        pair.datagrams(Client)
+            .send_on_path(second, Bytes::from_static(&[0; 1000]), false)?;
+    }
+    for group in 1..=2 {
+        let copy = Bytes::from(vec![group as u8; 1000]);
+        let group = NonZeroU64::new(group).unwrap();
+        pair.datagrams(Client)
+            .send_original_on_path(first, copy.clone(), group, false)?;
+        pair.datagrams(Client)
+            .send_copy_on_path(second, copy, group, false)?;
+    }
+    pair.drive();
+
+    let stats = pair.path_stats(Client, second).unwrap();
+    assert_eq!(
+        (stats.cancelled_copies, stats.cancelled_copy_bytes),
+        (2, 2000)
+    );
+    let received: Vec<Bytes> = core::iter::from_fn(|| pair.datagrams(Server).recv()).collect();
+    assert_eq!(received.len(), 62);
+    assert_eq!(received.iter().filter(|d| d[0] != 0).count(), 2);
     Ok(())
 }
 

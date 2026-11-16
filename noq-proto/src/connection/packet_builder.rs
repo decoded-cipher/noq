@@ -259,6 +259,11 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         self.buf.limit(self.frame_space_remaining())
     }
 
+    /// Records that the packet carries a copy of `group`
+    pub(super) fn record_copy(&mut self, group: core::num::NonZeroU64) {
+        self.sent_frames.copies.push(group);
+    }
+
     pub(super) fn sent_frames(&self) -> &SentFrames {
         &self.sent_frames
     }
@@ -304,6 +309,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             retransmits: sent.retransmits,
             path_retransmits: sent.path_retransmits,
             stream_frames: sent.stream_frames,
+            copies: sent.copies,
         };
 
         conn.paths.get_mut(&path_id).unwrap().data.sent(

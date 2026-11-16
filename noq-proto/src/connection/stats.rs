@@ -290,6 +290,11 @@ pub struct PathStats {
     pub lost_plpmtud_probes: u64,
     /// The number of times a black hole was detected in the path.
     pub black_holes_detected: u64,
+    /// The number of datagram copies queued on this path and dropped unsent because another
+    /// copy was acknowledged.
+    pub cancelled_copies: u64,
+    /// The payload bytes of [`Self::cancelled_copies`].
+    pub cancelled_copy_bytes: u64,
     /// Largest UDP payload size the path currently supports.
     pub current_mtu: u16,
 }
@@ -365,6 +370,8 @@ impl core::ops::Add<PathStats> for ConnectionStats {
             sent_plpmtud_probes: _,
             lost_plpmtud_probes: _,
             black_holes_detected: _,
+            cancelled_copies: _,
+            cancelled_copy_bytes: _,
             current_mtu: _,
         } = rhs;
         Self {
@@ -411,6 +418,8 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
             sent_plpmtud_probes: _,
             lost_plpmtud_probes: _,
             black_holes_detected: _,
+            cancelled_copies: _,
+            cancelled_copy_bytes: _,
             current_mtu: _,
         } = rhs;
         let Self {

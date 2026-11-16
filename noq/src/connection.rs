@@ -4,7 +4,7 @@ use std::{
     future::{Future, poll_fn},
     io, mem,
     net::{IpAddr, SocketAddr},
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     pin::Pin,
     sync::{
         Arc, Weak,
@@ -717,7 +717,7 @@ impl Connection {
         path: PathId,
         data: Bytes,
     ) -> Result<(), SendDatagramError> {
-        self.send_datagram_on_path_with(path, data, false)
+        self.send_datagram_on_path_with(path, data, false, None)
     }
 
     /// Transmit an unreliable, unordered application datagram on `path` only, ahead of the
@@ -731,7 +731,37 @@ impl Connection {
         path: PathId,
         data: Bytes,
     ) -> Result<(), SendDatagramError> {
-        self.send_datagram_on_path_with(path, data, true)
+        self.send_datagram_on_path_with(path, data, true, None)
+    }
+
+    /// Transmit `data` on `path` as the original of a datagram whose copies go on other paths
+    ///
+    /// Once a packet carrying it is acknowledged, the copies of `group` still queued are
+    /// dropped. Otherwise as [`send_urgent_datagram_on_path()`](Self::send_urgent_datagram_on_path)
+    /// if `urgent`, or [`send_datagram_on_path()`](Self::send_datagram_on_path).
+    pub fn send_datagram_original_on_path(
+        &self,
+        path: PathId,
+        data: Bytes,
+        group: NonZeroU64,
+        urgent: bool,
+    ) -> Result<(), SendDatagramError> {
+        self.send_datagram_on_path_with(path, data, urgent, Some((group, false)))
+    }
+
+    /// Transmit `data` on `path` as a copy of a datagram sent on several paths, dropped unsent
+    /// once a packet carrying its original or another copy is acknowledged
+    ///
+    /// The original and its copies share `group`; groups should increase in the order they are
+    /// sent. Otherwise as [`send_datagram_original_on_path()`](Self::send_datagram_original_on_path).
+    pub fn send_datagram_copy_on_path(
+        &self,
+        path: PathId,
+        data: Bytes,
+        group: NonZeroU64,
+        urgent: bool,
+    ) -> Result<(), SendDatagramError> {
+        self.send_datagram_on_path_with(path, data, urgent, Some((group, true)))
     }
 
     fn send_datagram_on_path_with(
@@ -739,6 +769,7 @@ impl Connection {
         path: PathId,
         data: Bytes,
         urgent: bool,
+        group: Option<(NonZeroU64, bool)>,
     ) -> Result<(), SendDatagramError> {
         let conn = &mut *self.0.lock_and_wake("send_datagram_on_path");
         if let Some(ref x) = conn.error {
@@ -746,9 +777,11 @@ impl Connection {
         }
         use proto::SendDatagramError::*;
         let mut datagrams = conn.inner.datagrams();
-        let sent = match urgent {
-            true => datagrams.send_urgent_on_path(path, data),
-            false => datagrams.send_on_path(path, data, true),
+        let sent = match (group, urgent) {
+            (Some((group, true)), _) => datagrams.send_copy_on_path(path, data, group, urgent),
+            (Some((group, false)), _) => datagrams.send_original_on_path(path, data, group, urgent),
+            (None, true) => datagrams.send_urgent_on_path(path, data),
+            (None, false) => datagrams.send_on_path(path, data, true),
         };
         match sent {
             Ok(()) => Ok(()),

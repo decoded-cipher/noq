@@ -33,7 +33,7 @@ use crate::{
     connection::{
         paths::PathRetransmits,
         qlog::{QlogRecvPacket, QlogSink},
-        spaces::LostPacket,
+        spaces::{CopyGroups, LostPacket},
         stats::PathStatsMap,
         timer::{ConnTimer, PathTimer},
     },
@@ -3242,6 +3242,7 @@ impl Connection {
                 self.on_packet_acked(now, path, packet, info);
             }
         }
+        self.datagrams.cancel_acked_copies(&mut self.path_stats);
 
         let largest_ackd = self.spaces[space].for_path(path).largest_acked_packet_pn;
         let path_data = self.path_data_mut(path);
@@ -3426,6 +3427,9 @@ impl Connection {
 
         for frame in info.stream_frames {
             self.streams.received_ack_of(frame);
+        }
+        for group in info.copies.iter() {
+            self.datagrams.copy_acked(group);
         }
     }
 
@@ -7968,6 +7972,7 @@ struct SentFrames {
     /// The packet number of the largest acknowledged packet for each path
     largest_acked: FxHashMap<PathId, u64>,
     stream_frames: StreamMetaVec,
+    copies: CopyGroups,
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     /// If the datagram containing these frames should be padded to the min MTU

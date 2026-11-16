@@ -5,6 +5,7 @@ use alloc::{
 };
 use core::{
     cmp, mem,
+    num::NonZeroU64,
     ops::{Bound, Index, IndexMut, Range},
 };
 
@@ -541,6 +542,45 @@ pub(super) struct SentPacket {
     ///
     /// The actual application data is stored with the stream state.
     pub(super) stream_frames: frame::StreamMetaVec,
+    /// Groups of the datagram copies in the packet, whose copies still queued are dropped once
+    /// it is acknowledged
+    pub(super) copies: CopyGroups,
+}
+
+/// Groups of the datagram copies in a packet: the first, and those up to 64 after it
+///
+/// Groups increase in the order copies are queued, so a packet's are increasing and close
+/// together. One out of reach is not recorded, and its copies are sent anyway.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct CopyGroups {
+    first: Option<NonZeroU64>,
+    /// Bit `i` is set when group `first + 1 + i` is in the packet too
+    after: u64,
+}
+
+impl CopyGroups {
+    pub(super) fn push(&mut self, group: NonZeroU64) {
+        let Some(first) = self.first else {
+            self.first = Some(group);
+            return;
+        };
+        if let Some(offset) = group.get().checked_sub(first.get().saturating_add(1))
+            && offset < u64::BITS as u64
+        {
+            self.after |= 1 << offset;
+        }
+    }
+
+    pub(super) fn iter(self) -> impl Iterator<Item = u64> {
+        let first = self.first.map_or(0, NonZeroU64::get);
+        let mut after = self.after;
+        let rest = core::iter::from_fn(move || {
+            let offset = after.trailing_zeros();
+            after &= after.checked_sub(1)?;
+            Some(first + 1 + offset as u64)
+        });
+        self.first.map(NonZeroU64::get).into_iter().chain(rest)
+    }
 }
 
 /// Represents one or more packets that are deemed lost.
@@ -1642,6 +1682,16 @@ mod test {
         acks.insert_one(2, t3);
         acks.packet_received(t3, 2, true, &dedup);
         assert_eq!(acks.ack_delay(t3), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn copy_groups_keep_those_within_reach_of_the_first() {
+        let mut groups = CopyGroups::default();
+        for group in [5, 5, 3, 6, 9, 69, 70] {
+            groups.push(NonZeroU64::new(group).unwrap());
+        }
+        assert_eq!(groups.iter().collect::<Vec<_>>(), [5, 6, 9, 69]);
+        assert_eq!(CopyGroups::default().iter().count(), 0);
     }
 
     #[test]

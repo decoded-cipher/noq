@@ -1,10 +1,11 @@
-use alloc::collections::VecDeque;
+use alloc::{collections::VecDeque, vec::Vec};
+use core::num::NonZeroU64;
 
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-use super::Connection;
+use super::{Connection, PathStatsMap};
 use crate::{
     FrameStats, FxHashMap, PathId, TransportError,
     connection::PacketBuilder,
@@ -27,7 +28,7 @@ impl Datagrams<'_> {
     ///
     /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
     pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
-        self.queue(None, data, drop, false)
+        self.queue(None, data, drop, false, None)
     }
 
     /// Queue an unreliable, unordered datagram to be sent on `path` only, whatever its status
@@ -40,7 +41,7 @@ impl Datagrams<'_> {
         data: Bytes,
         drop: bool,
     ) -> Result<(), SendDatagramError> {
-        self.queue_on_path(path, data, drop, false)
+        self.queue_on_path(path, data, drop, false, None)
     }
 
     /// Queue an unreliable, unordered datagram to be sent on `path` only, ahead of its
@@ -53,7 +54,47 @@ impl Datagrams<'_> {
         path: PathId,
         data: Bytes,
     ) -> Result<(), SendDatagramError> {
-        self.queue_on_path(path, data, true, true)
+        self.queue_on_path(path, data, true, true, None)
+    }
+
+    /// Queue `data` on `path` as the original of a datagram whose copies go on other paths
+    /// with [`Self::send_copy_on_path`]
+    ///
+    /// It is never cancelled, but once a packet carrying it is acknowledged, the copies of
+    /// `group` still queued are dropped. Otherwise as [`Self::send_urgent_on_path`] if `urgent`,
+    /// or [`Self::send_on_path`] dropping older datagrams to make room.
+    pub fn send_original_on_path(
+        &mut self,
+        path: PathId,
+        data: Bytes,
+        group: NonZeroU64,
+        urgent: bool,
+    ) -> Result<(), SendDatagramError> {
+        let group = Group {
+            id: group,
+            copy: false,
+        };
+        self.queue_on_path(path, data, true, urgent, Some(group))
+    }
+
+    /// Queue `data` on `path` as a copy of a datagram sent on several paths, dropped unsent
+    /// once a packet carrying its original or another copy is acknowledged
+    ///
+    /// The original and its copies share `group`. Groups should increase in the order they are
+    /// queued, as cancelling stops at the first larger group in a path's queue. Otherwise as
+    /// [`Self::send_original_on_path`].
+    pub fn send_copy_on_path(
+        &mut self,
+        path: PathId,
+        data: Bytes,
+        group: NonZeroU64,
+        urgent: bool,
+    ) -> Result<(), SendDatagramError> {
+        let group = Group {
+            id: group,
+            copy: true,
+        };
+        self.queue_on_path(path, data, true, urgent, Some(group))
     }
 
     fn queue_on_path(
@@ -62,11 +103,12 @@ impl Datagrams<'_> {
         data: Bytes,
         drop: bool,
         urgent: bool,
+        group: Option<Group>,
     ) -> Result<(), SendDatagramError> {
         if !self.conn.paths.contains_key(&path) || self.conn.abandoned_paths.contains(&path) {
             return Err(SendDatagramError::PathClosed);
         }
-        self.queue(Some(path), data, drop, urgent)
+        self.queue(Some(path), data, drop, urgent, group)
     }
 
     fn queue(
@@ -75,6 +117,7 @@ impl Datagrams<'_> {
         data: Bytes,
         drop: bool,
         urgent: bool,
+        group: Option<Group>,
     ) -> Result<(), SendDatagramError> {
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
@@ -97,10 +140,7 @@ impl Datagrams<'_> {
             datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        match urgent {
-            true => buffer.push_urgent(Datagram { data }),
-            false => buffer.push_back(Datagram { data }),
-        }
+        buffer.push(Datagram { data }, group, urgent);
         Ok(())
     }
 
@@ -232,6 +272,8 @@ pub(super) struct DatagramState {
     pub(super) outgoing: DatagramBuffer,
     pub(super) outgoing_on_path: FxHashMap<PathId, DatagramBuffer>,
     pub(super) send_blocked: bool,
+    /// Copy groups acknowledged since their queued copies were last cancelled
+    acked_copies: Vec<u64>,
 }
 
 impl DatagramState {
@@ -318,6 +360,30 @@ impl DatagramState {
                 .is_some_and(|buffer| !buffer.is_empty())
     }
 
+    /// Notes that a packet carrying a copy of `group` was acknowledged
+    pub(super) fn copy_acked(&mut self, group: u64) {
+        self.acked_copies.push(group);
+    }
+
+    /// Drops the queued copies of the groups acknowledged since the last call
+    pub(super) fn cancel_acked_copies(&mut self, stats: &mut PathStatsMap) {
+        if self.acked_copies.is_empty() {
+            return;
+        }
+        self.acked_copies.sort_unstable();
+        self.acked_copies.dedup();
+        for (&path, buffer) in &mut self.outgoing_on_path {
+            let (copies, bytes) = buffer.cancel(&self.acked_copies);
+            if copies > 0 {
+                trace!(%path, copies, "cancelled copies already delivered");
+                let stats = stats.get_mut(path);
+                stats.cancelled_copies += copies;
+                stats.cancelled_copy_bytes += bytes;
+            }
+        }
+        self.acked_copies.clear();
+    }
+
     pub(super) fn discard_path(&mut self, path: PathId) {
         if let Some(buffer) = self.outgoing_on_path.remove(&path) {
             trace!(%path, count = buffer.len(), "dropping datagrams bound to discarded path");
@@ -325,7 +391,7 @@ impl DatagramState {
     }
 
     pub(super) fn recv(&mut self) -> Option<Bytes> {
-        let x = self.incoming.pop_front()?.data;
+        let x = self.incoming.pop_front()?.datagram.data;
         Some(x)
     }
 
@@ -336,7 +402,7 @@ impl DatagramState {
     pub(super) fn recv_many(&mut self, out: &mut [Bytes]) -> usize {
         let n = out.len().min(self.incoming.len());
         for (i, d) in self.incoming.drain_front(n).enumerate() {
-            out[i] = d.data;
+            out[i] = d.datagram.data;
         }
         n
     }
@@ -345,39 +411,74 @@ impl DatagramState {
 #[derive(Default)]
 pub(super) struct DatagramBuffer {
     /// Sent before `queue`
-    urgent: VecDeque<Datagram>,
-    queue: VecDeque<Datagram>,
+    urgent: VecDeque<Queued>,
+    queue: VecDeque<Queued>,
     payload_bytes: usize,
+    /// How many of the datagrams in `urgent` and in `queue` are copies
+    copies: [usize; 2],
+}
+
+/// A datagram waiting in a [`DatagramBuffer`]
+struct Queued {
+    datagram: Datagram,
+    group: Option<Group>,
+}
+
+impl Queued {
+    fn is_copy(&self) -> bool {
+        self.group.is_some_and(|group| group.copy)
+    }
+}
+
+/// The group shared by a datagram's original and its copies on other paths
+#[derive(Clone, Copy)]
+struct Group {
+    id: NonZeroU64,
+    copy: bool,
 }
 
 impl DatagramBuffer {
-    fn push_back(&mut self, datagram: Datagram) {
+    fn push(&mut self, datagram: Datagram, group: Option<Group>, urgent: bool) {
         self.payload_bytes += datagram.data.len();
-        self.queue.push_back(datagram);
-    }
-
-    fn push_urgent(&mut self, datagram: Datagram) {
-        self.payload_bytes += datagram.data.len();
-        self.urgent.push_back(datagram);
-    }
-
-    /// Removes the next datagram to send
-    fn pop_front(&mut self) -> Option<Datagram> {
-        let datagram = self.next_queue().pop_front()?;
-        self.payload_bytes -= datagram.data.len();
-        Some(datagram)
-    }
-
-    /// The queue the next datagram is sent from
-    fn next_queue(&mut self) -> &mut VecDeque<Datagram> {
-        match self.urgent.is_empty() {
-            true => &mut self.queue,
-            false => &mut self.urgent,
+        self.copies[!urgent as usize] += group.is_some_and(|group| group.copy) as usize;
+        let queued = Queued { datagram, group };
+        match urgent {
+            true => self.urgent.push_back(queued),
+            false => self.queue.push_back(queued),
         }
     }
 
+    fn push_back(&mut self, datagram: Datagram) {
+        self.push(datagram, None, false);
+    }
+
+    #[cfg(test)]
+    fn push_urgent(&mut self, datagram: Datagram) {
+        self.push(datagram, None, true);
+    }
+
+    /// Removes the next datagram to send
+    fn pop_front(&mut self) -> Option<Queued> {
+        let urgent = !self.urgent.is_empty();
+        let queued = match urgent {
+            true => self.urgent.pop_front(),
+            false => self.queue.pop_front(),
+        }?;
+        self.forget(&queued, urgent);
+        Some(queued)
+    }
+
+    /// Accounts for `queued` having left the buffer
+    fn forget(&mut self, queued: &Queued, urgent: bool) {
+        self.payload_bytes -= queued.datagram.data.len();
+        self.copies[!urgent as usize] -= queued.is_copy() as usize;
+    }
+
     fn front(&self) -> Option<&Datagram> {
-        self.urgent.front().or_else(|| self.queue.front())
+        self.urgent
+            .front()
+            .or_else(|| self.queue.front())
+            .map(|queued| &queued.datagram)
     }
 
     /// Payload bytes queued and not yet sent
@@ -393,11 +494,15 @@ impl DatagramBuffer {
     /// Drops the oldest datagrams, urgent ones last, until `datagram_len` more bytes fit
     fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
         while !self.has_send_buffer_space(datagram_len, send_buffer_size) {
-            let Some(prev) = self.queue.pop_front().or_else(|| self.urgent.pop_front()) else {
+            let urgent = self.queue.is_empty();
+            let Some(prev) = (match urgent {
+                true => self.urgent.pop_front(),
+                false => self.queue.pop_front(),
+            }) else {
                 break;
             };
-            self.payload_bytes -= prev.data.len();
-            trace!(len = prev.data.len(), "dropping outgoing datagram");
+            self.forget(&prev, urgent);
+            trace!(len = prev.datagram.data.len(), "dropping outgoing datagram");
         }
     }
 
@@ -412,22 +517,70 @@ impl DatagramBuffer {
     fn drop_oversized(&mut self, max_payload: usize) -> bool {
         let mut dropped_any = false;
         let payload_bytes = &mut self.payload_bytes;
-        for queue in [&mut self.urgent, &mut self.queue] {
-            queue.retain(|datagram| {
-                let result = datagram.data.len() < max_payload;
+        let [urgent_copies, queue_copies] = &mut self.copies;
+        for (queue, copies) in [
+            (&mut self.urgent, urgent_copies),
+            (&mut self.queue, queue_copies),
+        ] {
+            queue.retain(|queued| {
+                let len = queued.datagram.data.len();
+                let result = len < max_payload;
                 if !result {
                     trace!(
                         "dropping {} byte datagram violating {} byte limit",
-                        datagram.data.len(),
-                        max_payload
+                        len, max_payload
                     );
-                    *payload_bytes -= datagram.data.len();
+                    *payload_bytes -= len;
+                    *copies -= queued.is_copy() as usize;
                     dropped_any = true;
                 }
                 result
             });
         }
         dropped_any
+    }
+
+    /// Drops the queued copies of the `acked` groups, which are sorted
+    ///
+    /// Returns how many copies and payload bytes were dropped.
+    fn cancel(&mut self, acked: &[u64]) -> (u64, u64) {
+        let (mut cancelled, mut bytes) = (0, 0);
+        let Some(&last) = acked.last() else {
+            return (0, 0);
+        };
+        let [urgent_copies, queue_copies] = &mut self.copies;
+        for (queue, copies) in [
+            (&mut self.urgent, urgent_copies),
+            (&mut self.queue, queue_copies),
+        ] {
+            let mut unseen = *copies;
+            let mut index = 0;
+            while unseen > 0 && index < queue.len() {
+                let queued = &queue[index];
+                let Some(group) = queued.group.filter(|_| queued.is_copy()) else {
+                    index += 1;
+                    continue;
+                };
+                let group = group.id.get();
+                if group > last {
+                    break;
+                }
+                unseen -= 1;
+                if acked.binary_search(&group).is_err() {
+                    index += 1;
+                    continue;
+                }
+                let Some(queued) = queue.remove(index) else {
+                    break;
+                };
+                let len = queued.datagram.data.len();
+                self.payload_bytes -= len;
+                *copies -= 1;
+                cancelled += 1;
+                bytes += len as u64;
+            }
+        }
+        (cancelled, bytes)
     }
 
     /// Attempt to write the next datagram frame into `buf`, consuming it
@@ -442,10 +595,13 @@ impl DatagramBuffer {
         {
             return false;
         }
-        let Some(datagram) = self.pop_front() else {
+        let Some(queued) = self.pop_front() else {
             return false;
         };
-        buf.write_frame(datagram, stat);
+        if let Some(group) = queued.group {
+            buf.record_copy(group.id);
+        }
+        buf.write_frame(queued.datagram, stat);
         true
     }
 
@@ -462,10 +618,10 @@ impl DatagramBuffer {
     }
 
     /// Removes and returns the first `n` datagrams, in arrival order.
-    fn drain_front(&mut self, n: usize) -> impl Iterator<Item = Datagram> + '_ {
+    fn drain_front(&mut self, n: usize) -> impl Iterator<Item = Queued> + '_ {
         let payload_bytes = &mut self.payload_bytes;
-        self.queue.drain(..n).inspect(|datagram| {
-            *payload_bytes -= datagram.data.len();
+        self.queue.drain(..n).inspect(|queued| {
+            *payload_bytes -= queued.datagram.data.len();
         })
     }
 }
@@ -489,7 +645,7 @@ mod tests {
             .make_space_for(4, 10 + 2 * size_of::<Datagram>());
 
         assert_eq!(state.outgoing.queue.len(), 1);
-        assert_eq!(state.outgoing.queue[0].data.len(), 2);
+        assert_eq!(state.outgoing.queue[0].datagram.data.len(), 2);
         assert_eq!(state.outgoing.payload_bytes, 2);
     }
 
@@ -511,15 +667,37 @@ mod tests {
         // Room for one more 3-byte datagram costs both bulk ones, not the urgent one.
         buffer.make_space_for(3, 6 + 2 * size_of::<Datagram>());
         assert_eq!(buffer.len(), 1);
-        assert_eq!(buffer.pop_front().map(|d| d.data.len()), Some(3));
+        assert_eq!(buffer.pop_front().map(|d| d.datagram.data.len()), Some(3));
         assert!(buffer.is_empty());
         assert_eq!(buffer.payload_bytes(), 0);
     }
 
     #[test]
+    fn acknowledged_groups_lose_their_queued_copies() {
+        let mut buffer = DatagramBuffer::default();
+        let copy = |id| NonZeroU64::new(id).map(|id| Group { id, copy: true });
+        buffer.push(datagram(1), copy(1), false);
+        buffer.push(datagram(2), None, false);
+        buffer.push(datagram(3), copy(2), false);
+        let original = NonZeroU64::new(3).map(|id| Group { id, copy: false });
+        buffer.push(datagram(6), original, false);
+        buffer.push(datagram(4), copy(3), true);
+        buffer.push(datagram(5), copy(5), false);
+
+        assert_eq!(buffer.cancel(&[1, 3, 4]), (2, 5));
+        assert_eq!(buffer.payload_bytes(), 16);
+        assert_eq!(buffer.copies, [0, 2]);
+        let left: Vec<usize> = core::iter::from_fn(|| buffer.pop_front())
+            .map(|queued| queued.datagram.data.len())
+            .collect();
+        assert_eq!(left, [2, 3, 6, 5]);
+        assert_eq!(buffer.copies, [0, 0]);
+    }
+
+    #[test]
     fn make_space_for_handles_overflowing_capacity_check() {
         let mut state = DatagramState::default();
-        state.outgoing.queue.push_back(Datagram {
+        state.outgoing.push_back(Datagram {
             data: Bytes::from_static(&[0]),
         });
         state.outgoing.payload_bytes = usize::MAX - 1;
