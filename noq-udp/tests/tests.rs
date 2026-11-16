@@ -176,6 +176,40 @@ fn ecn_v6_dualstack() {
     }
 }
 
+/// An IPv4 packet's destination on a dual-stack socket is told as IPv4, so it
+/// matches an IPv4 source address a path sends from.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn dualstack_dst_ip_of_ipv4_is_ipv4() {
+    let recv = Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .unwrap();
+    recv.set_only_v6(false).unwrap();
+    recv.bind(&socket2::SockAddr::from(
+        "[::]:0".parse::<SocketAddr>().unwrap(),
+    ))
+    .unwrap();
+    let port = recv.local_addr().unwrap().as_socket().unwrap().port();
+    let recv_state = UdpSocketState::new((&recv).into()).unwrap();
+    recv.set_nonblocking(false).unwrap();
+
+    let send = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    send.send_to(b"hello", (Ipv4Addr::LOCALHOST, port)).unwrap();
+    let mut buf = [0; 64];
+    let mut meta = RecvMeta::default();
+    recv_state
+        .recv(
+            (&recv).into(),
+            &mut [IoSliceMut::new(&mut buf)],
+            slice::from_mut(&mut meta),
+        )
+        .unwrap();
+    assert_eq!(meta.dst_ip, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+}
+
 #[test]
 #[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
 fn ecn_v4_mapped_v6() {

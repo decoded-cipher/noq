@@ -118,9 +118,13 @@ impl UdpSocketState {
                 libc::IP_PMTUDISC_PROBE,
             )?;
 
-            if is_ipv4 {
+            // On a dual-stack socket too, so an IPv4 packet's destination comes
+            // as IPv4, after its IPv4-mapped form, and matches the address a path
+            // sends from.
+            if is_ipv4 || !io.only_v6()? {
                 set_socket_option(&*io, libc::IPPROTO_IP, libc::IP_PKTINFO, OPTION_ON)?;
-            } else {
+            }
+            if !is_ipv4 {
                 // Set `may_fragment` to `true` if this option is not supported on the platform.
                 may_fragment |= !set_socket_option_supported(
                     &*io,
