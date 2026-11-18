@@ -1007,6 +1007,25 @@ impl Connection {
         Ok(mem::replace(&mut path.data.keep_alive, interval))
     }
 
+    /// Sets the longest wait between path challenges while nothing has come back on a path
+    ///
+    /// Such a path may lead nowhere, so its challenges back off up to this, 30 s unless set.
+    /// Takes effect from the next challenge. Returns the previous value of the setting.
+    pub fn set_path_unanswered_retry_interval(
+        &mut self,
+        path_id: PathId,
+        interval: Duration,
+    ) -> Result<Duration, ClosedPath> {
+        let path = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(ClosedPath { _private: () })?;
+        Ok(mem::replace(
+            &mut path.data.unanswered_retry_interval,
+            interval,
+        ))
+    }
+
     /// Find an open, validated path that's on the same network path as the given network path.
     ///
     /// Returns the first path matching, even if there's multiple.
@@ -2176,10 +2195,14 @@ impl Connection {
         // full of packets the outage took, and only an answered probe ends the outage.
         let outage_probe =
             self.path_data(path_id).outage && self.spaces[space_id].for_path(path_id).pending_ping;
+        // Nor a due path challenge: a path nothing has come back on has a window full of
+        // earlier challenges, and anything queued beside one would otherwise hold it back.
+        let challenge = space_id == SpaceId::Data && self.path_data(path_id).pending_challenge;
 
         if (can_send.other || can_send.space_specific || can_send.unpinned_data)
             && !need_loss_probe
             && !outage_probe
+            && !challenge
             && !can_send.close
         {
             let path = self.path_data(path_id);
@@ -7968,6 +7991,10 @@ const MAX_BACKOFF_EXPONENT: u32 = 16;
 ///
 /// This is the "normal" value we use.
 const MAX_PTO_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The default longest wait between path challenges on a path nothing has come back on,
+/// such as one from a link that cannot reach the peer.
+const MAX_UNANSWERED_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The idle time, below which we use the shorter [`MAX_PTO_FAST_INTERVAL`].
 const MIN_IDLE_FOR_FAST_PTO: Duration = Duration::from_secs(25);

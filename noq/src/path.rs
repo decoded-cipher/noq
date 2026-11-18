@@ -239,6 +239,22 @@ impl Path {
             .set_path_keep_alive_interval(self.id(), interval)
     }
 
+    /// Sets the longest wait between path challenges while nothing has come back on the path
+    ///
+    /// Such a path may lead nowhere, so its challenges back off up to this, 30 s unless set.
+    /// Returns the previous value of the setting.
+    pub fn set_unanswered_retry_interval(
+        &self,
+        interval: Duration,
+    ) -> Result<Duration, ClosedPath> {
+        let mut state = self
+            .conn
+            .lock_and_wake("path_set_unanswered_retry_interval");
+        state
+            .inner
+            .set_path_unanswered_retry_interval(self.id(), interval)
+    }
+
     /// Track changes on our external address as reported by the peer.
     ///
     /// If the address-discovery extension is not negotiated, the stream will never return.

@@ -526,6 +526,75 @@ fn open_path_validation_fails_server_side() -> TestResult {
     Ok(())
 }
 
+/// Routes where the client's second address reaches nothing, or with `open`, reaches
+/// the server's second address.
+fn second_address_routes(open: bool) -> ManyToManyRouting {
+    ManyToManyRouting::from_routes(
+        [(Pair::CLIENT_ADDR, 0), ("[::1:2]:1".parse().unwrap(), 1)],
+        [
+            (Pair::SERVER_ADDR, 0),
+            ("[::2:2]:1".parse().unwrap(), usize::from(open)),
+        ],
+    )
+}
+
+/// A pair whose connection outlives the test, with the client's second address cut off.
+fn pair_with_a_cut_off_address() -> (ConnPair, FourTuple) {
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(second_address_routes(false));
+    for cfg in [
+        &mut builder.client_transport_cfg,
+        &mut builder.server_transport_cfg,
+    ] {
+        cfg.max_idle_timeout(Some(crate::VarInt::from_u32(600_000).into()));
+    }
+    builder
+        .client_transport_cfg
+        .keep_alive_interval(Some(Duration::from_secs(5)));
+    let network_path = FourTuple {
+        remote: "[::2:2]:1".parse().unwrap(),
+        local_ip: Some("::1:2".parse().unwrap()),
+    };
+    (builder.connect(), network_path)
+}
+
+/// A path nothing comes back on is tried ever more sparingly, but never given up on: a
+/// link that cannot reach the peer costs a challenge every 30 s, not every 2 s, and is
+/// found once it can.
+#[test]
+fn an_unanswered_path_backs_off_and_is_found() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, network_path) = pair_with_a_cut_off_address();
+    let path_id = pair.open_path(Client, network_path, PathStatus::Available)?;
+    let start = pair.time;
+    let sent_by = |pair: &mut ConnPair, secs| {
+        while pair.time < start + Duration::from_secs(secs) && pair.step() {}
+        pair.path_stats(Client, path_id).unwrap().udp_tx.datagrams
+    };
+    let after_a_minute = sent_by(&mut pair, 60);
+    let after_five = sent_by(&mut pair, 300);
+    let sent = after_five - after_a_minute;
+    assert!((7..=8).contains(&sent), "{sent} challenges in 4 minutes");
+
+    pair.routes = second_address_routes(true).into();
+    let mut established = false;
+    while pair.time < start + Duration::from_secs(331) && !established && pair.step() {
+        while let Some(event) = pair.poll(Client) {
+            established |= matches!(
+                event,
+                Event::Path(PathEvent::Established { id }) if id == path_id
+            );
+        }
+    }
+    assert!(
+        established,
+        "the path was not found within 31 s of reaching the server"
+    );
+    Ok(())
+}
+
 /// client starts opening a path but the client fails to validate the path
 ///
 /// The server should receive an event close the path

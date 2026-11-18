@@ -16,7 +16,7 @@ use crate::{
     TransportErrorCode, VarInt,
     coding::{self, Decodable, Encodable},
     congestion,
-    connection::{MAX_BACKOFF_EXPONENT, MAX_PTO_INTERVAL},
+    connection::{MAX_BACKOFF_EXPONENT, MAX_PTO_INTERVAL, MAX_UNANSWERED_INTERVAL},
     frame::ObservedAddr,
 };
 
@@ -219,6 +219,8 @@ pub(super) struct PathData {
     /// Similar to [`Self::pto_count`], but for on-path path challenges.
     /// Used to calculate exponential backoff for retrying path challenges.
     pub(super) lost_challenge_count: u32,
+    /// The longest wait between path challenges while nothing has come back on the path.
+    pub(super) unanswered_retry_interval: Duration,
     /// Whether we're certain the peer can both send and receive on this address
     ///
     /// Initially equal to `use_stateless_retry` for servers, and becomes false again on every
@@ -344,6 +346,7 @@ impl PathData {
             ran_dry: false,
             unconfirmed_challenges: Default::default(),
             lost_challenge_count: 0,
+            unanswered_retry_interval: MAX_UNANSWERED_INTERVAL,
             pending_challenge: false,
             validated: false,
             total_sent: 0,
@@ -409,6 +412,7 @@ impl PathData {
             ran_dry: false,
             unconfirmed_challenges: Default::default(),
             lost_challenge_count: 0,
+            unanswered_retry_interval: prev.unanswered_retry_interval,
             pending_challenge: false,
             validated: false,
             total_sent: 0,
@@ -531,7 +535,14 @@ impl PathData {
     pub(super) fn on_path_challenge_pto(&self) -> Duration {
         let backoff = 2u32.pow(self.lost_challenge_count.min(MAX_BACKOFF_EXPONENT));
         let duration = self.rtt.pto_base() * backoff;
-        duration.min(MAX_PTO_INTERVAL)
+        // Nothing has come back on this path: it may lead nowhere, so it is tried
+        // ever more sparingly, though never given up on.
+        let max = if self.total_recvd == 0 {
+            self.unanswered_retry_interval
+        } else {
+            MAX_PTO_INTERVAL
+        };
+        duration.min(max)
     }
 
     /// Handle receiving a PATH_RESPONSE.
