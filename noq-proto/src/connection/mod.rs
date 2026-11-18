@@ -711,6 +711,41 @@ impl Connection {
         Ok(())
     }
 
+    /// Abandons a path the peer abandoned before any of its packets reached us.
+    ///
+    /// Its path ID is used up all the same, so it is answered with PATH_ABANDON, letting the
+    /// peer drop the path, and another path ID is granted in its place (multipath draft
+    /// §3.4). Returns whether `path_id` was such a path.
+    fn abandon_unseen_path(
+        &mut self,
+        now: Instant,
+        path_id: PathId,
+        error_code: TransportErrorCode,
+    ) -> bool {
+        if self.paths.contains_key(&path_id)
+            || self.abandoned_paths.contains(&path_id)
+            || path_id > self.local_max_path_id
+        {
+            return false;
+        }
+        self.abandoned_paths.insert(path_id);
+        self.spaces[SpaceId::Data]
+            .pending
+            .path_abandon
+            .insert(path_id, error_code);
+        // Its connection IDs are retired once anything still on its way has had time to
+        // arrive, as for a path that drains.
+        let rtt = RttEstimator::new(self.config.initial_rtt);
+        let pto = rtt.pto_base() + self.ack_frequency.max_ack_delay_for_pto();
+        self.timers.set(
+            Timer::PerPath(path_id, PathTimer::PathDrained),
+            now + 3 * pto,
+            self.qlog.with_time(now),
+        );
+        self.set_max_path_id(now, self.local_max_path_id.saturating_add(1u8));
+        true
+    }
+
     /// Unconditionally abandon a path.
     ///
     /// Only to be called once sure this path should be abandoned, all checks
@@ -2860,7 +2895,9 @@ impl Connection {
                                     );
                                 }
                             }
-                            self.discard_path(path_id, now);
+                            if self.paths.contains_key(&path_id) {
+                                self.discard_path(path_id, now);
+                            }
                         }
                     }
                 }
@@ -5656,7 +5693,11 @@ impl Connection {
                             trace!("peer abandoned path");
                         }
                         Err(ClosePathError::ClosedPath) => {
-                            trace!("peer abandoned already closed path");
+                            if self.abandon_unseen_path(now, path_id, error_code) {
+                                trace!("peer abandoned a path we never saw");
+                            } else {
+                                trace!("peer abandoned already closed path");
+                            }
                         }
                         Err(ClosePathError::MultipathNotNegotiated) => {
                             return Err(TransportError::PROTOCOL_VIOLATION(

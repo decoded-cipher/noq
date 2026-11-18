@@ -595,6 +595,28 @@ fn an_unanswered_path_backs_off_and_is_found() -> TestResult {
     Ok(())
 }
 
+/// A path the server never heard from is abandoned all the same: the server answers the
+/// client's PATH_ABANDON and grants another path ID, so links that never reached the
+/// server cannot use up the connection's paths.
+#[test]
+fn abandoning_a_path_the_server_never_saw_frees_its_id() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, network_path) = pair_with_a_cut_off_address();
+    for _ in 0..2 * MAX_PATHS {
+        let path_id = pair.open_path(Client, network_path, PathStatus::Available)?;
+        let tried = pair.time;
+        while pair.time < tried + Duration::from_secs(5) && pair.step() {}
+        pair.close_path(Client, path_id, 0u8.into())?;
+        let closed = pair.time;
+        while pair.time < closed + Duration::from_secs(10) && pair.step() {}
+        assert!(
+            pair.path_stats(Client, path_id).is_none(),
+            "{path_id} was not dropped"
+        );
+    }
+    Ok(())
+}
+
 /// client starts opening a path but the client fails to validate the path
 ///
 /// The server should receive an event close the path
