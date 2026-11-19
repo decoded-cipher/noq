@@ -560,6 +560,36 @@ fn pair_with_a_cut_off_address() -> (ConnPair, FourTuple) {
     (builder.connect(), network_path)
 }
 
+/// The client abandons the server's last path while the path meant to replace it has not
+/// reached the server, as on a phone's slow link: the server is left with no path for a
+/// moment and closes once its grace has run out, without panicking where it schedules an
+/// ACK_FREQUENCY frame.
+#[test]
+fn last_path_abandoned_before_its_replacement_reaches_the_server() -> TestResult {
+    let _guard = subscribe();
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(second_address_routes(false));
+    for cfg in [
+        &mut builder.client_transport_cfg,
+        &mut builder.server_transport_cfg,
+    ] {
+        cfg.ack_frequency_config(Some(AckFrequencyConfig::default()));
+    }
+    let mut pair = builder.connect();
+    let cut_off = FourTuple {
+        remote: "[::2:2]:1".parse().unwrap(),
+        local_ip: Some("::1:2".parse().unwrap()),
+    };
+    pair.open_path(Client, cut_off, PathStatus::Available)?;
+    pair.close_path(Client, PathId::ZERO, 0u8.into())?;
+    let start = pair.time;
+    while pair.time < start + Duration::from_secs(10) && pair.step() {}
+    assert!(pair.is_closed(Server));
+    Ok(())
+}
+
 /// A path nothing comes back on is tried ever more sparingly, but never given up on: a
 /// link that cannot reach the peer costs a challenge every 30 s, not every 2 s, and is
 /// found once it can.

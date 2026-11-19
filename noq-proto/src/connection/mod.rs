@@ -1213,14 +1213,12 @@ impl Connection {
             _ => false,
         };
 
-        // Schedule an ACK_FREQUENCY frame if a new one needs to be sent.
-        if let Some(config) = &self.config.ack_frequency_config {
-            let rtt = self
-                .paths
-                .values()
-                .map(|p| p.data.rtt.get())
-                .min()
-                .expect("one path exists");
+        // Schedule an ACK_FREQUENCY frame if a new one needs to be sent. A connection can be
+        // left with no path for a moment, as when its last one is abandoned while a
+        // replacement still waits for its challenge to be answered: nothing is scheduled then.
+        if let Some(config) = &self.config.ack_frequency_config
+            && let Some(rtt) = self.paths.values().map(|p| p.data.rtt.get()).min()
+        {
             self.spaces[SpaceId::Data].pending.ack_frequency = self
                 .ack_frequency
                 .should_send_ack_frequency(rtt, config, &self.peer_params)
